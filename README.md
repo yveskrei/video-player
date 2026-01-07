@@ -25,7 +25,7 @@ cd backend && uv sync
 cd frontend && npm install
 ```
 
-Start a development environment:
+Start a development environment(unified for frontend and backend):
 ```
 ./run_local.sh
 ```

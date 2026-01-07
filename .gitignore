@@ -1,0 +1,81 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+__init__.py
+
+# Virtual environment
+env/
+venv/
+ENV/
+.venv/
+.ENV/
+*.env
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# PyTorch model files
+*.pt
+*.pth
+
+# Python build artifacts
+build/
+dist/
+*.egg-info/
+*.eggs
+*.manifest
+*.spec
+
+# Logs and debugging
+*.log
+*.out
+*.err
+*.pickle
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# UV files
+*uv.lock
+
+# NPM
+*node_modules/
+*package-lock.json
+*yarn.lock
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.orig
+*.old
+
+# Test results
+.coverage
+*.coverage.*
+nosetests.xml
+pytest_cache/
+htmlcov/
+.tox/
+
+# File containers
+*.zip
+*.tar
+*.gz
+
+# Project-specific
+*Cargo.lock
+*target/
+library/dependencies/
+*.mp4
+*.so
+*.mpd
+*.m4s

@@ -1,18 +1,18 @@
-export interface Video {
+export type StreamStatus = 'stopped' | 'initializing' | 'streaming' | 'terminating';
+
+export interface VideoInfo {
     id: number;
     name: string;
-    is_streaming: boolean;
-}
-
-export interface StreamStatus {
-    is_streaming: boolean;
+    file_path: string;
+    created_at: string;
+    width: number;
+    height: number;
+    fps: number;
+    stream_status: StreamStatus;
     stream_start_time_ms: number | null;
-    dash: {
-        manifest_url: string;
-    } | null;
-    relay: {
-        port: number;
-    } | null;
+    dash_manifest_url: string | null;
+    prog_url: string | null;
+    prog_init_url: string | null;
 }
 
 export interface BBox {
@@ -23,14 +23,16 @@ export interface BBox {
 }
 
 export interface BBoxMessage {
+    type: 'bbox_update';
+    video_id: number;
     pts: number;
     bboxes: BBox[];
     stream_start_time_ms?: number;
-    video_id?: number;
     timestamp?: number;
 }
 
-export interface StreamInfoMessage {
-    type: 'stream_info';
-    // Add fields if needed
+export interface VideoUpdateMessage {
+    type: 'video_update';
+    reason: 'created' | 'deleted' | 'stream_initializing' | 'stream_started' | 'stream_stopped' | 'stream_error';
+    video?: VideoInfo & { id: number };
 }

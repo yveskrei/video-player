@@ -4,541 +4,502 @@ import time
 import threading
 import logging
 import os
+import struct
+import shutil
+import queue as qmod
 from pathlib import Path
 from fastapi import HTTPException
 from storage import storage
-from websocket_manager import manager as ws_manager
-from tcp_relay import TCPRelay
+from enums import StreamStatus, VideoUpdateReason
+from websocket_manager import manager as ws_manager, broadcast_sync
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+DASH_OUTPUT_DIR = Path("./dash_streams")
+PROGRESSIVE_OUTPUT_DIR = Path("./progressive_streams")
+DASH_SEGMENT_DURATION = 2   # seconds
+DASH_WINDOW_SIZE = 5
+INIT_TIMEOUT = 10           # seconds to wait for DASH manifest
+
+
 class StreamManager:
-    """Handles FFmpeg streaming with DASH output and TCP Relay for AI"""
-    
-    DASH_OUTPUT_DIR = Path("./dash_streams")
-    TCP_EXTERNAL_BASE_PORT = 9000  # Base port for external clients (AI) - TCP
-    UDP_INTERNAL_BASE_PORT = 19000 # Base port for internal FFmpeg -> Relay (UDP)
-    
-    # DASH segment retention settings
-    DASH_SEGMENT_DURATION = 2  # seconds
-    DASH_WINDOW_SIZE = 5  # keep last 5 segments
-    
-    _stderr_threads = {}
-    _stream_locks = {}
-    _client_counts = {}
-    _relays = {} # Store active TCPRelay instances
-    
-    def __init__(self):
-        self.DASH_OUTPUT_DIR.mkdir(exist_ok=True)
-    
-    @staticmethod
-    def _get_ports(video_id: int) -> tuple[int, int]:
-        """Returns (internal_udp_port, external_tcp_port)"""
-        return (
-            StreamManager.UDP_INTERNAL_BASE_PORT + video_id,
-            StreamManager.TCP_EXTERNAL_BASE_PORT + video_id
-        )
-    
+
+    _monitor_threads: dict = {}
+    _stream_locks: dict = {}
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _get_lock(video_id: int) -> threading.Lock:
         if video_id not in StreamManager._stream_locks:
             StreamManager._stream_locks[video_id] = threading.Lock()
         return StreamManager._stream_locks[video_id]
-    
+
     @staticmethod
-    def _consume_stderr(video_id: int, process):
-        """Consume stderr and terminate stream on ANY error"""
-        logger.info(f"[Stream {video_id}] Starting stderr consumer thread")
-        
-        try:
-            for line in iter(process.stderr.readline, b''):
-                if not line:
-                    break
-                    
-                line_str = line.decode('utf-8', errors='ignore').strip()
-                
-                # Log all output at DEBUG level
-                logger.debug(f"[Stream {video_id}] FFmpeg: {line_str}")
-                
-                # Check for ANY error - terminate immediately
-                if 'error' in line_str.lower() and 'configuration:' not in line_str.lower() and '0 decode errors' not in line_str.lower():
-                    logger.error(f"[Stream {video_id}] ERROR detected, terminating stream: {line_str}")
-                    try:
-                        # Terminate the process immediately
-                        pgid = os.getpgid(process.pid)
-                        os.killpg(pgid, signal.SIGTERM)
-                        logger.info(f"[Stream {video_id}] Sent SIGTERM to process group")
-                    except (ProcessLookupError, OSError) as e:
-                        logger.warning(f"[Stream {video_id}] Could not terminate process: {e}")
-                    break
-                elif 'warning' in line_str.lower():
-                    logger.warning(f"[Stream {video_id}] FFmpeg warning: {line_str}")
-                    
-        except Exception as e:
-            # This can happen normally when process is killed
-            logger.info(f"[Stream {video_id}] Stderr consumer thread finished: {e}")
-        finally:
-            logger.info(f"[Stream {video_id}] Stderr consumer thread stopped")
-    
-    @staticmethod
-    def _validate_video_properties(video_data: dict) -> None:
-        """Validate that video has all required properties with valid values"""
+    def _validate_video(video_data: dict) -> None:
         width = video_data.get("width")
         height = video_data.get("height")
         fps = video_data.get("fps")
-        
         if not width or width <= 0:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Invalid video properties: width={width}. Video must have valid dimensions."
-            )
-        
+            raise HTTPException(400, f"Invalid video width: {width}")
         if not height or height <= 0:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Invalid video properties: height={height}. Video must have valid dimensions."
-            )
-        
+            raise HTTPException(400, f"Invalid video height: {height}")
         if not fps or fps <= 0:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Invalid video properties: fps={fps}. Video must have valid frame rate."
-            )
-    
+            raise HTTPException(400, f"Invalid video fps: {fps}")
+
     @staticmethod
-    def _start_ffmpeg_process(video_id: int) -> dict:
-        """Start FFmpeg process for both DASH and TCP Relay streaming"""
-        video_data = storage.videos[video_id]
-        file_path = video_data["file_path"]
-        
-        # Validate video properties
-        StreamManager._validate_video_properties(video_data)
-        
-        internal_port, external_port = StreamManager._get_ports(video_id)
-        stream_start_time = int(time.time() * 1000)
-        
-        output_width = video_data["width"]
-        output_height = video_data["height"]
-        output_fps = video_data["fps"]
-        
-        relay_info = {
-            "port": external_port,
-            "width": output_width,
-            "height": output_height,
-            "pix_fmt": "rgb24",
-            "fps": output_fps,
+    def _build_video_payload(video_id: int) -> dict:
+        """Build the video data dict sent in WebSocket VIDEO_UPDATE events."""
+        video = storage.videos.get(video_id, {})
+        stream = storage.active_streams.get(video_id)
+        status = stream["status"] if stream else StreamStatus.STOPPED
+        return {
+            "id": video_id,
+            "name": video.get("name", ""),
+            "file_path": video.get("file_path", ""),
+            "created_at": video.get("created_at", ""),
+            "width": video.get("width", 0),
+            "height": video.get("height", 0),
+            "fps": video.get("fps", 0.0),
+            "stream_status": status,
+            "stream_start_time_ms": stream.get("start_time_ms") if stream else None,
+            "dash_manifest_url": stream.get("dash_manifest_url") if stream else None,
+            "prog_url": f"/progressive/{video_id}/prog.m4s" if stream else None,
+            "prog_init_url": f"/progressive/{video_id}/progressive.mp4" if stream else None,
         }
-        
-        logger.info(f"[Stream {video_id}] Starting stream from {file_path}")
-        logger.info(f"[Stream {video_id}] Relay Info: {relay_info}")
-        
-        # Start TCP Relay
-        relay = TCPRelay(internal_port, external_port)
-        relay.start()
-        StreamManager._relays[video_id] = relay
-        logger.info(f"[Stream {video_id}] TCP Relay started")
-        
-        dash_dir = StreamManager.DASH_OUTPUT_DIR / str(video_id)
-        dash_dir.mkdir(parents=True, exist_ok=True)
-        dash_manifest = dash_dir / "manifest.mpd"
-        
-        cmd = [
-            "ffmpeg",
-            "-probesize", "50M",
-            "-analyzeduration", "100M",
-            "-err_detect", "ignore_err",
-            "-re",
-            "-stream_loop", "-1",
-            "-fflags", "+genpts",
-            "-i", file_path,
-            "-filter_complex", f"[0:v]fps=fps={output_fps}[v_base]; [v_base]split=2[v_dash][v_udp]",
-            
-            "-map", "[v_dash]",
-            "-an",  # Explicitly disable audio output
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-preset", "veryfast",
-            "-tune", "zerolatency",
-            "-b:v", "2M",
-            "-maxrate", "2M",
-            "-bufsize", "4M",
-            "-g", str(int(output_fps * 2)),
-            "-f", "dash",
-            "-seg_duration", str(StreamManager.DASH_SEGMENT_DURATION),
-            "-window_size", str(StreamManager.DASH_WINDOW_SIZE),
-            "-extra_window_size", str(StreamManager.DASH_WINDOW_SIZE),
-            "-remove_at_exit", "1",
-            "-streaming", "1",
-            "-ldash", "1",
-            "-loglevel", "verbose",  # More detailed logging
-            str(dash_manifest),
-            
-            # UDP output (to Internal Relay Port)
-            "-map", "[v_udp]",
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
-            "-pix_fmt", "yuv420p",
-            "-f", "mpegts",
-            "-mpegts_copyts", "1",
-            f"udp://127.0.0.1:{internal_port}?pkt_size=1316"
-        ]
-        
-        logger.debug(f"[Stream {video_id}] FFmpeg command: {' '.join(cmd)}")
-        
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-            bufsize=0,
-            preexec_fn=os.setsid
-        )
-        
-        logger.info(f"[Stream {video_id}] FFmpeg process started (PID: {process.pid})")
-        
-        storage.active_streams[video_id] = {
-            'process': process,
-            'start_time_ms': stream_start_time,
-            'relay_info': relay_info,
-            'dash_manifest': str(dash_manifest)
-        }
-        storage.videos[video_id]["is_streaming"] = True
-        
+
+    # ------------------------------------------------------------------
+    # MP4 init segment extraction (ftyp + moov from FFmpeg stdout)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _read_mp4_init(stdout) -> bytes:
+        """
+        Read ftyp + moov boxes from FFmpeg stdout pipe.
+        Returns the raw bytes of the init segment.
+        Raises RuntimeError if the pipe closes before moov is complete.
+        """
+        init_bytes = b""
+
+        while True:
+            # Read 8-byte box header (size + type)
+            header = b""
+            while len(header) < 8:
+                chunk = stdout.read(8 - len(header))
+                if not chunk:
+                    raise RuntimeError("FFmpeg stdout closed before init segment was complete")
+                header += chunk
+
+            box_size = struct.unpack(">I", header[:4])[0]
+            box_type = header[4:8].decode("ascii", errors="ignore")
+
+            if box_size == 1:
+                # Extended 64-bit size follows the type field
+                ext = b""
+                while len(ext) < 8:
+                    chunk = stdout.read(8 - len(ext))
+                    if not chunk:
+                        raise RuntimeError("FFmpeg stdout closed reading extended box size")
+                    ext += chunk
+                box_size = struct.unpack(">Q", ext)[0]
+                header += ext
+                remaining = box_size - 16
+            elif box_size == 0:
+                raise RuntimeError(f"Unsupported MP4 box with size=0 (extends to EOF): {box_type}")
+            else:
+                remaining = box_size - 8
+
+            # Read box content
+            content = b""
+            while len(content) < remaining:
+                chunk = stdout.read(min(65536, remaining - len(content)))
+                if not chunk:
+                    raise RuntimeError(f"FFmpeg stdout closed while reading {box_type} box content")
+                content += chunk
+
+            init_bytes += header + content
+            logger.debug(f"[Init] Read box: {box_type} ({box_size} bytes)")
+
+            if box_type == "moov":
+                logger.info(f"[Init] Complete — {len(init_bytes)} bytes")
+                break
+
+            if len(init_bytes) > 10 * 1024 * 1024:
+                raise RuntimeError("Init segment exceeds 10 MB safety limit — possible format issue")
+
+        return init_bytes
+
+    # ------------------------------------------------------------------
+    # Background threads (stderr reader, stdout drainer, monitor)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _stderr_reader(video_id: int, process) -> None:
+        """Drain FFmpeg stderr to prevent pipe blocking."""
+        try:
+            for line in iter(process.stderr.readline, b""):
+                if not line:
+                    break
+                logger.debug(f"[Stream {video_id}] FFmpeg: {line.decode('utf-8', errors='ignore').strip()}")
+        except Exception as e:
+            logger.debug(f"[Stream {video_id}] Stderr reader ended: {e}")
+
+    @staticmethod
+    def _stdout_reader(video_id: int, process) -> None:
+        """
+        Drain FFmpeg stdout after init is extracted.
+        Prevents FFmpeg from blocking when no HTTP consumer is connected.
+        When a consumer is active, pushes chunks to its queue.
+        """
+        while process.poll() is None:
+            try:
+                chunk = process.stdout.read1(65536)
+            except Exception:
+                break
+            if not chunk:
+                time.sleep(0.005)
+                continue
+            stream = storage.active_streams.get(video_id)
+            if not stream:
+                break
+            q = stream.get("consumer_queue")
+            if q is not None:
+                try:
+                    q.put_nowait(chunk)
+                except qmod.Full:
+                    pass  # slow consumer — drop chunk rather than block FFmpeg
+
+    @staticmethod
+    def _do_terminate(video_id: int, process, stderr_thread, stdout_reader) -> None:
+        """Kill FFmpeg, signal the consumer queue, join threads, clean dirs."""
+        logger.info(f"[Stream {video_id}] Terminating FFmpeg...")
+
+        # Signal consumer so its HTTP generator exits cleanly
+        stream = storage.active_streams.get(video_id)
+        if stream:
+            q = stream.get("consumer_queue")
+            if q is not None:
+                try:
+                    q.put_nowait(None)  # sentinel: tells consumer to stop
+                except qmod.Full:
+                    pass
+
+        # Kill FFmpeg process group
+        try:
+            pgid = os.getpgid(process.pid)
+            os.killpg(pgid, signal.SIGTERM)
+            try:
+                process.wait(timeout=5)
+                logger.info(f"[Stream {video_id}] FFmpeg terminated cleanly")
+            except subprocess.TimeoutExpired:
+                logger.warning(f"[Stream {video_id}] SIGTERM timeout — force killing")
+                os.killpg(pgid, signal.SIGKILL)
+                process.wait()
+        except (ProcessLookupError, OSError) as e:
+            logger.debug(f"[Stream {video_id}] Process cleanup: {e}")
+
+        stderr_thread.join(timeout=2)
+        if stdout_reader is not None:
+            stdout_reader.join(timeout=2)
+
+        # Remove output directories
+        for d in [
+            DASH_OUTPUT_DIR / str(video_id),
+            PROGRESSIVE_OUTPUT_DIR / str(video_id),
+        ]:
+            if d.exists():
+                shutil.rmtree(d, ignore_errors=True)
+                logger.info(f"[Stream {video_id}] Removed {d}")
+
+        # Remove from active_streams
+        storage.active_streams.pop(video_id, None)
+
+    @staticmethod
+    def _monitor(video_id: int) -> None:
+        """
+        Lifecycle thread for a single stream:
+          1. Read progressive init bytes from stdout → write progressive.mp4
+          2. Poll for DASH manifest (INITIALIZING → STREAMING or TERMINATING)
+          3. Watch for FFmpeg errors / death (STREAMING → TERMINATING)
+          4. Terminate and clean up
+        """
+        stream = storage.active_streams.get(video_id)
+        if not stream:
+            return
+
+        process = stream["process"]
+        dash_manifest = DASH_OUTPUT_DIR / str(video_id) / "manifest.mpd"
+        prog_dir = PROGRESSIVE_OUTPUT_DIR / str(video_id)
+
+        # --- Start stderr reader ---
         stderr_thread = threading.Thread(
-            target=StreamManager._consume_stderr,
+            target=StreamManager._stderr_reader,
             args=(video_id, process),
-            daemon=True
+            daemon=True,
         )
         stderr_thread.start()
-        StreamManager._stderr_threads[video_id] = stderr_thread
-        
-        # Wait for stream to initialize and validate
-        time.sleep(3)
-        
-        if process.poll() is not None:
-            logger.error(f"[Stream {video_id}] Process died immediately after start")
-            # Clean up
-            if video_id in StreamManager._relays:
-                StreamManager._relays[video_id].stop()
-                del StreamManager._relays[video_id]
-            if video_id in storage.active_streams:
-                del storage.active_streams[video_id]
-            if video_id in storage.videos:
-                storage.videos[video_id]["is_streaming"] = False
-            if video_id in StreamManager._stderr_threads:
-                del StreamManager._stderr_threads[video_id]
-            raise HTTPException(
-                status_code=500, 
-                detail="FFmpeg process died immediately after start. Video file may be corrupted or invalid."
+
+        stdout_reader = None
+
+        # --- Phase 0: extract progressive init segment from stdout ---
+        try:
+            logger.info(f"[Stream {video_id}] Reading progressive init from stdout...")
+            init_bytes = StreamManager._read_mp4_init(process.stdout)
+            prog_dir.mkdir(parents=True, exist_ok=True)
+            (prog_dir / "progressive.mp4").write_bytes(init_bytes)
+            stream["prog_init_ready"].set()
+            logger.info(f"[Stream {video_id}] progressive.mp4 ready")
+        except Exception as e:
+            logger.error(f"[Stream {video_id}] Init extraction failed: {e}")
+            stream = storage.active_streams.get(video_id)
+            if stream:
+                stream["status"] = StreamStatus.TERMINATING
+
+        # --- Start stdout drainer (takes over stdout after init) ---
+        stdout_reader = threading.Thread(
+            target=StreamManager._stdout_reader,
+            args=(video_id, process),
+            daemon=True,
+        )
+        stdout_reader.start()
+
+        # --- Phase 1: INITIALIZING — poll for DASH manifest ---
+        stream = storage.active_streams.get(video_id)
+        if stream and stream["status"] == StreamStatus.INITIALIZING:
+            deadline = time.time() + INIT_TIMEOUT
+            while time.time() < deadline:
+                stream = storage.active_streams.get(video_id)
+                if not stream or stream["status"] == StreamStatus.TERMINATING:
+                    break
+                if process.poll() is not None:
+                    logger.error(f"[Stream {video_id}] FFmpeg died during initialization (rc={process.returncode})")
+                    if stream:
+                        stream["status"] = StreamStatus.TERMINATING
+                    break
+                if dash_manifest.exists():
+                    stream["status"] = StreamStatus.STREAMING
+                    logger.info(f"[Stream {video_id}] → STREAMING")
+                    broadcast_sync(
+                        ws_manager.broadcast_video_update(
+                            video_id,
+                            VideoUpdateReason.STREAM_STARTED,
+                            StreamManager._build_video_payload(video_id),
+                        )
+                    )
+                    break
+                time.sleep(0.5)
+            else:
+                # Loop exhausted — timeout
+                logger.error(f"[Stream {video_id}] Initialization timeout — no manifest after {INIT_TIMEOUT}s")
+                stream = storage.active_streams.get(video_id)
+                if stream and stream["status"] == StreamStatus.INITIALIZING:
+                    stream["status"] = StreamStatus.TERMINATING
+
+        # --- Phase 2: STREAMING — watch for FFmpeg death or manual stop ---
+        stream = storage.active_streams.get(video_id)
+        if stream and stream["status"] == StreamStatus.STREAMING:
+            while True:
+                stream = storage.active_streams.get(video_id)
+                if not stream or stream["status"] == StreamStatus.TERMINATING:
+                    break
+                if process.poll() is not None:
+                    logger.error(f"[Stream {video_id}] FFmpeg died during streaming (rc={process.returncode})")
+                    if stream:
+                        stream["status"] = StreamStatus.TERMINATING
+                    broadcast_sync(
+                        ws_manager.broadcast_video_update(
+                            video_id,
+                            VideoUpdateReason.STREAM_ERROR,
+                            StreamManager._build_video_payload(video_id),
+                        )
+                    )
+                    break
+                time.sleep(1.0)
+
+        # --- Phase 3: TERMINATING — cleanup ---
+        StreamManager._do_terminate(video_id, process, stderr_thread, stdout_reader)
+
+        # Broadcast final STOPPED state (active_streams entry is now gone)
+        if video_id in storage.videos:
+            broadcast_sync(
+                ws_manager.broadcast_video_update(
+                    video_id,
+                    VideoUpdateReason.STREAM_STOPPED,
+                    StreamManager._build_video_payload(video_id),
+                )
             )
-        
-        # Validate DASH manifest was created
-        if not dash_manifest.exists():
-            logger.error(f"[Stream {video_id}] DASH manifest not created")
-            # Terminate process and clean up
+
+        StreamManager._monitor_threads.pop(video_id, None)
+        logger.info(f"[Stream {video_id}] Monitor thread done")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def start_stream(cls, video_id: int) -> None:
+        """
+        Start streaming a video.
+        Sets status to INITIALIZING immediately and returns.
+        The monitor thread handles the rest of the lifecycle.
+        """
+        if video_id not in storage.videos:
+            raise HTTPException(404, f"Video {video_id} not found")
+
+        lock = cls._get_lock(video_id)
+        with lock:
+            if video_id in storage.active_streams:
+                status = storage.active_streams[video_id]["status"]
+                raise HTTPException(409, f"Stream is already {status}")
+
+            video_data = storage.videos[video_id]
+            cls._validate_video(video_data)
+
+            fps = video_data["fps"]
+            keyframe_interval = str(int(fps * 2))
+
+            # Create DASH output directory
+            dash_dir = DASH_OUTPUT_DIR / str(video_id)
+            dash_dir.mkdir(parents=True, exist_ok=True)
+
+            cmd = [
+                "ffmpeg",
+                "-v", "warning",
+                "-probesize", "50M",
+                "-analyzeduration", "100M",
+                "-err_detect", "ignore_err",
+                "-re",
+                "-stream_loop", "-1",
+                "-fflags", "+genpts",
+                "-i", video_data["file_path"],
+                "-filter_complex",
+                f"[0:v]fps=fps={fps}[v_base]; [v_base]split=2[v_dash][v_prog]",
+
+                # --- DASH output ---
+                "-map", "[v_dash]",
+                "-an",
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-preset", "veryfast",
+                "-tune", "zerolatency",
+                "-b:v", "2M",
+                "-maxrate", "2M",
+                "-bufsize", "4M",
+                "-g", keyframe_interval,
+                "-f", "dash",
+                "-seg_duration", str(DASH_SEGMENT_DURATION),
+                "-window_size", str(DASH_WINDOW_SIZE),
+                "-extra_window_size", str(DASH_WINDOW_SIZE),
+                "-remove_at_exit", "1",
+                "-streaming", "1",
+                "-ldash", "1",
+                str(dash_dir / "manifest.mpd"),
+
+                # --- Progressive fMP4 → stdout ---
+                "-map", "[v_prog]",
+                "-an",
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-b:v", "2M",
+                "-g", keyframe_interval,
+                "-f", "mp4",
+                "-movflags", "frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
+                "-frag_duration", "200000",
+                "pipe:1",
+            ]
+
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                bufsize=-1,
+                preexec_fn=os.setsid,
+            )
+
+            logger.info(f"[Stream {video_id}] FFmpeg started (PID {process.pid})")
+
+            storage.active_streams[video_id] = {
+                "status": StreamStatus.INITIALIZING,
+                "process": process,
+                "pid": process.pid,
+                "start_time_ms": int(time.time() * 1000),
+                "dash_manifest_url": f"/dash/{video_id}/manifest.mpd",
+                "prog_init_ready": threading.Event(),
+                "consumer_queue": None,
+                "prog_consumer_active": False,
+            }
+
+            broadcast_sync(
+                ws_manager.broadcast_video_update(
+                    video_id,
+                    VideoUpdateReason.STREAM_INITIALIZING,
+                    cls._build_video_payload(video_id),
+                )
+            )
+
+            monitor = threading.Thread(
+                target=cls._monitor, args=(video_id,), daemon=True
+            )
+            monitor.start()
+            cls._monitor_threads[video_id] = monitor
+
+    @classmethod
+    def stop_stream(cls, video_id: int) -> None:
+        """
+        Request a stream to stop.
+        Sets status to TERMINATING and kills FFmpeg.
+        The monitor thread handles cleanup and broadcasts STOPPED when done.
+        """
+        lock = cls._get_lock(video_id)
+        with lock:
+            stream = storage.active_streams.get(video_id)
+            if not stream:
+                raise HTTPException(404, f"No active stream for video {video_id}")
+            if stream["status"] == StreamStatus.TERMINATING:
+                raise HTTPException(409, "Stream is already terminating")
+
+            stream["status"] = StreamStatus.TERMINATING
+
+            # Kill FFmpeg immediately to unblock any blocked stdout reads in the monitor
             try:
-                pgid = os.getpgid(process.pid)
+                pgid = os.getpgid(stream["pid"])
                 os.killpg(pgid, signal.SIGTERM)
-                process.wait(timeout=5)
-            except:
+            except (ProcessLookupError, OSError):
                 pass
-            
-            if video_id in StreamManager._relays:
-                StreamManager._relays[video_id].stop()
-                del StreamManager._relays[video_id]
-            if video_id in storage.active_streams:
-                del storage.active_streams[video_id]
-            if video_id in storage.videos:
-                storage.videos[video_id]["is_streaming"] = False
-            if video_id in StreamManager._stderr_threads:
-                del StreamManager._stderr_threads[video_id]
-            
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to create DASH manifest. Stream initialization failed."
-            )
-        
-        logger.info(f"[Stream {video_id}] Stream started successfully")
-        
+
+    @classmethod
+    def get_stream_status(cls, video_id: int) -> dict:
+        if video_id not in storage.videos:
+            raise HTTPException(404, f"Video {video_id} not found")
+        stream = storage.active_streams.get(video_id)
+        if not stream:
+            return {"video_id": video_id, "status": StreamStatus.STOPPED}
         return {
             "video_id": video_id,
-            "status": "streaming",
-            "stream_start_time_ms": stream_start_time,
-            "pid": process.pid,
-            "relay": relay_info,
-            "dash": {
-                "manifest_url": f"/dash/{video_id}/manifest.mpd"
-            }
+            "status": stream["status"],
+            "pid": stream.get("pid"),
+            "start_time_ms": stream.get("start_time_ms"),
         }
-    
-    @staticmethod
-    def start_stream(video_id: int) -> dict:
-        """
-        Start streaming for a video. 
-        Always uses original video resolution and DASH format.
-        """
-        if video_id not in storage.videos:
-            raise HTTPException(status_code=404, detail=f"Video {video_id} not found")
-        
-        lock = StreamManager._get_lock(video_id)
-        
-        with lock:
-            # Track client count
-            if video_id not in StreamManager._client_counts:
-                StreamManager._client_counts[video_id] = 0
-            
-            StreamManager._client_counts[video_id] += 1
-            logger.info(f"[Stream {video_id}] Client connected. Total clients: {StreamManager._client_counts[video_id]}")
-            
-            # Check if stream already exists
-            if video_id in storage.active_streams:
-                stream_data = storage.active_streams[video_id]
-                process = stream_data['process']
-                
-                if process.poll() is None:
-                    # Stream is active, return existing info
-                    logger.info(f"[Stream {video_id}] Reusing existing stream")
-                    return {
-                        "video_id": video_id,
-                        "status": "streaming",
-                        "stream_start_time_ms": stream_data['start_time_ms'],
-                        "pid": process.pid,
-                        "relay": stream_data['relay_info'],
-                        "dash": {
-                            "manifest_url": f"/dash/{video_id}/manifest.mpd"
-                        },
-                        "clients": StreamManager._client_counts[video_id]
-                    }
-                else:
-                    # Process died, clean up and restart
-                    logger.warning(f"[Stream {video_id}] Found dead stream, cleaning up and restarting")
-                    if video_id in StreamManager._relays:
-                        StreamManager._relays[video_id].stop()
-                        del StreamManager._relays[video_id]
-                    del storage.active_streams[video_id]
-                    storage.videos[video_id]["is_streaming"] = False
-                    # Note: _client_counts[video_id] is preserved
-            
-            # Start new stream
-            try:
-                result = StreamManager._start_ffmpeg_process(video_id)
-                result["clients"] = StreamManager._client_counts[video_id]
-                return result
-            except HTTPException:
-                # Re-raise HTTP exceptions as-is
-                StreamManager._client_counts[video_id] -= 1
-                if StreamManager._client_counts[video_id] <= 0:
-                    del StreamManager._client_counts[video_id]
-                raise
-            except Exception as e:
-                # Cleanup on failure
-                StreamManager._client_counts[video_id] -= 1
-                if StreamManager._client_counts[video_id] <= 0:
-                    del StreamManager._client_counts[video_id]
-                
-                logger.error(f"[Stream {video_id}] Failed to start stream: {e}")
-                
-                if video_id in StreamManager._relays:
-                    StreamManager._relays[video_id].stop()
-                    del StreamManager._relays[video_id]
-                if video_id in storage.active_streams:
-                    del storage.active_streams[video_id]
-                if video_id in storage.videos:
-                    storage.videos[video_id]["is_streaming"] = False
-                
-                raise HTTPException(status_code=500, detail=f"Failed to start stream: {str(e)}")
-    
-    @staticmethod
-    async def stop_stream(video_id: int) -> dict:
-        """Stop streaming for a video (reference counting for multiple clients)"""
-        lock = StreamManager._get_lock(video_id)
-        
-        with lock:
-            # Decrement client count
-            if video_id in StreamManager._client_counts:
-                StreamManager._client_counts[video_id] -= 1
-                logger.info(f"[Stream {video_id}] Client disconnected. Remaining clients: {StreamManager._client_counts[video_id]}")
-                
-                # Keep stream alive if other clients are connected
-                if StreamManager._client_counts[video_id] > 0:
-                    return {
-                        "video_id": video_id,
-                        "status": "streaming",
-                        "clients": StreamManager._client_counts[video_id],
-                        "message": "Stream continues for other clients"
-                    }
-                
-                del StreamManager._client_counts[video_id]
-            else:
-                logger.warning(f"[Stream {video_id}] Stop called but no clients were tracked")
 
-            
-            # Check if stream exists (it should if client_counts just hit zero)
-            if video_id not in storage.active_streams:
-                logger.warning(f"[Stream {video_id}] Stop called, client count is zero, but stream not in active_streams")
-                # Ensure consistency - defensive check
-                if video_id in storage.videos:
-                    storage.videos[video_id]["is_streaming"] = False
-                return {
-                    "video_id": video_id,
-                    "status": "already_stopped"
-                }
-            
-            stream_data = storage.active_streams[video_id]
-            process = stream_data['process']
-            
-            logger.info(f"[Stream {video_id}] Stopping stream (PID: {process.pid})")
-            
-            # Stop Relay
-            if video_id in StreamManager._relays:
-                logger.info(f"[Stream {video_id}] Stopping TCP Relay")
-                StreamManager._relays[video_id].stop()
-                del StreamManager._relays[video_id]
-            
-            # Terminate FFmpeg process
-            try:
-                pgid = os.getpgid(process.pid)
-                os.killpg(pgid, signal.SIGTERM)
-                
-                try:
-                    process.wait(timeout=5)
-                    logger.info(f"[Stream {video_id}] Process terminated cleanly")
-                except subprocess.TimeoutExpired:
-                    logger.warning(f"[Stream {video_id}] SIGTERM timeout, force killing")
-                    os.killpg(pgid, signal.SIGKILL)
-                    process.wait()
-                    logger.info(f"[Stream {video_id}] Process force killed")
-            except (ProcessLookupError, OSError) as e:
-                logger.warning(f"[Stream {video_id}] Process cleanup error: {e}")
-            
-            # Clean up storage - defensive checks
-            if video_id in storage.active_streams:
-                del storage.active_streams[video_id]
-            if video_id in storage.videos:
-                storage.videos[video_id]["is_streaming"] = False
-            
-            # Clean up stderr thread
-            if video_id in StreamManager._stderr_threads:
-                stderr_thread = StreamManager._stderr_threads[video_id]
-                stderr_thread.join(timeout=2)
-                del StreamManager._stderr_threads[video_id]
-            
-            # Clean up DASH directory
-            dash_dir = StreamManager.DASH_OUTPUT_DIR / str(video_id)
-            if dash_dir.exists():
-                import shutil
-                try:
-                    shutil.rmtree(dash_dir)
-                    logger.info(f"[Stream {video_id}] DASH directory cleaned up")
-                except Exception as e:
-                    logger.warning(f"[Stream {video_id}] Could not remove DASH dir: {e}")
-            
-            time.sleep(0.5)
-            
-            logger.info(f"[Stream {video_id}] Stream stopped and cleaned up")
-            
-            # Force close WebSockets
-            try:
-                await ws_manager.close_connections(video_id)
-            except Exception as e:
-                logger.warning(f"[Stream {video_id}] Failed to close websockets: {e}")
-
-            return {
-                "video_id": video_id,
-                "status": "stopped"
-            }
-    
-    @staticmethod
-    def get_stream_status(video_id: int) -> dict:
-        """Get current status of a stream"""
-        if video_id not in storage.videos:
-            raise HTTPException(status_code=404, detail=f"Video {video_id} not found")
-        
-        lock = StreamManager._get_lock(video_id)
-        
-        with lock:
-            is_active = video_id in storage.active_streams
-            
-            result = {
-                "video_id": video_id,
-                "is_streaming": is_active,
-                "clients": StreamManager._client_counts.get(video_id, 0)
-            }
-            
-            if is_active:
-                stream_data = storage.active_streams[video_id]
-                process = stream_data['process']
-                
-                poll_result = process.poll()
-                
-                if poll_result is not None:
-                    # Process died unexpectedly
-                    logger.warning(f"[Stream {video_id}] Detected dead process during status check (exit code: {poll_result})")
-                    
-                    # Clean up storage - defensive checks
-                    if video_id in StreamManager._relays:
-                        StreamManager._relays[video_id].stop()
-                        del StreamManager._relays[video_id]
-                    if video_id in storage.active_streams:
-                        del storage.active_streams[video_id]
-                    if video_id in storage.videos:
-                        storage.videos[video_id]["is_streaming"] = False
-                    
-                    # Clean up client count if it's still > 0
-                    if video_id in StreamManager._client_counts:
-                        logger.warning(f"[Stream {video_id}] Removing {StreamManager._client_counts[video_id]} clients from dead stream")
-                        del StreamManager._client_counts[video_id]
-                        
-                    result["is_streaming"] = False
-                    result["clients"] = 0
-                    result["error"] = f"Stream process died unexpectedly (exit code: {poll_result})"
-                else:
-                    # Stream is active
-                    result["status"] = "streaming"
-                    result["stream_start_time_ms"] = stream_data['start_time_ms']
-                    result["pid"] = process.pid
-                    result["relay"] = stream_data['relay_info']
-                    result["dash"] = {
-                        "manifest_url": f"/dash/{video_id}/manifest.mpd"
-                    }
-                    if video_id in StreamManager._relays:
-                        relay = StreamManager._relays[video_id]
-                        result["relay_clients"] = relay.get_client_count()
-                        result["relay_alive"] = relay.is_alive()
-                        if not relay.is_alive():
-                            result["warning"] = "TCP Relay thread is dead! Check logs."
-            else:
-                # If it's not active, client count should be 0
-                if StreamManager._client_counts.get(video_id, 0) > 0:
-                    logger.warning(f"[Stream {video_id}] Stream is not active but client count is {StreamManager._client_counts[video_id]}. Resetting.")
-                    del StreamManager._client_counts[video_id]
-                    result["clients"] = 0
-                
-                # Ensure consistency - defensive check
-                if video_id in storage.videos:
-                    storage.videos[video_id]["is_streaming"] = False
-        
-        return result
-    
-    @staticmethod
-    def cleanup_all_streams():
-        """Cleanup all active streams (called on shutdown)"""
+    @classmethod
+    def cleanup_all_streams(cls) -> None:
+        """Stop all active streams — called on application shutdown."""
         logger.info("Cleaning up all active streams...")
-        video_ids = list(storage.active_streams.keys())
-        
-        for video_id in video_ids:
+        for video_id in list(storage.active_streams.keys()):
             try:
-                lock = StreamManager._get_lock(video_id)
-                with lock:
-                    # Set client count to 1 to ensure cleanup happens
-                    # regardless of tracked clients
-                    StreamManager._client_counts[video_id] = 1
-                StreamManager.stop_stream(video_id)
+                cls.stop_stream(video_id)
             except Exception as e:
-                logger.error(f"[Stream {video_id}] Error during cleanup: {e}")
-        
+                logger.debug(f"[Stream {video_id}] Cleanup stop: {e}")
+        # Wait for monitor threads to finish
+        for video_id, thread in list(cls._monitor_threads.items()):
+            thread.join(timeout=8)
         logger.info("All streams cleaned up")
+
 
 stream_manager = StreamManager()

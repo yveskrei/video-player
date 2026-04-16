@@ -1,31 +1,36 @@
 from fastapi import APIRouter, UploadFile, File, Form
+from fastapi.responses import Response
 from typing import Optional
-
-# Custom modules
 from models import VideoInfo
 from video_manager import VideoManager
 
 router = APIRouter(prefix="/videos", tags=["videos"])
 
-@router.post("/upload", response_model=VideoInfo)
+
+@router.post("/upload", status_code=204)
 async def upload_video(
     file: UploadFile = File(...),
-    name: Optional[str] = Form(None)
+    name: Optional[str] = Form(None),
 ):
-    """Upload a video file"""
-    return await VideoManager.create_video(file, name or file.filename)
+    """Upload a video file. Creation event broadcast via WebSocket."""
+    await VideoManager.create_video(file, name or file.filename)
+    return Response(status_code=204)
 
-@router.get("/{video_id}", response_model=VideoInfo)
-def get_video(video_id: int):
-    """Get video by ID"""
-    return VideoManager.get_video(video_id)
 
 @router.get("/", response_model=list[VideoInfo])
 def list_videos():
-    """List all videos"""
+    """List all videos with current stream status."""
     return VideoManager.list_videos()
 
-@router.delete("/{video_id}")
+
+@router.get("/{video_id}", response_model=VideoInfo)
+def get_video(video_id: int):
+    """Get a video by ID with current stream status."""
+    return VideoManager.get_video(video_id)
+
+
+@router.delete("/{video_id}", status_code=204)
 def delete_video(video_id: int):
-    """Delete a video"""
-    return VideoManager.delete_video(video_id)
+    """Delete a video. Deletion event broadcast via WebSocket."""
+    VideoManager.delete_video(video_id)
+    return Response(status_code=204)

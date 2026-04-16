@@ -1,49 +1,99 @@
-import React, { useEffect, useState } from 'react';
-import { listVideos, uploadVideo, deleteVideo, startStream, stopStream, getStreamStatus } from '../api/streams';
-import type { Video } from '../types';
-import { Play, Square, Trash2, Info, Upload, RefreshCw, Film, Activity } from 'lucide-react';
+import React, { useEffect, useState, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { listVideos, uploadVideo, deleteVideo, startStream, stopStream } from '../api/streams';
+import type { VideoInfo, StreamStatus, VideoUpdateMessage } from '../types';
+import { Play, Square, Trash2, Info, Upload, RefreshCw, Film, Activity, Tv } from 'lucide-react';
 import clsx from 'clsx';
 import toast from 'react-hot-toast';
 import { Modal } from '../components/Modal';
+import { useWebSocket } from '../hooks/useWebSocket';
+import { getBackendUrl } from '../api/client';
+
+const StatusBadge: React.FC<{ status: StreamStatus }> = ({ status }) => {
+    if (status === 'streaming') {
+        return (
+            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border bg-green-500/10 text-green-400 border-green-500/20">
+                <span className="w-1.5 h-1.5 rounded-full bg-green-400 mr-1.5 animate-pulse" />
+                Streaming
+            </span>
+        );
+    }
+    if (status === 'initializing') {
+        return (
+            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border bg-orange-500/10 text-orange-400 border-orange-500/20">
+                <span className="w-1.5 h-1.5 rounded-full bg-orange-400 mr-1.5" />
+                Initializing
+            </span>
+        );
+    }
+    if (status === 'terminating') {
+        return (
+            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border bg-orange-500/10 text-orange-400 border-orange-500/20">
+                <span className="w-1.5 h-1.5 rounded-full bg-orange-400 mr-1.5" />
+                Terminating
+            </span>
+        );
+    }
+    return (
+        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border bg-zinc-800 text-zinc-400 border-zinc-700">
+            <span className="w-1.5 h-1.5 rounded-full bg-zinc-500 mr-1.5" />
+            Stopped
+        </span>
+    );
+};
 
 export const Management: React.FC = () => {
-    const [videos, setVideos] = useState<Video[]>([]);
+    const [videos, setVideos] = useState<VideoInfo[]>([]);
     const [loading, setLoading] = useState(false);
     const [uploading, setUploading] = useState(false);
 
-    // Modals State
     const [uploadModalOpen, setUploadModalOpen] = useState(false);
     const [deleteModalOpen, setDeleteModalOpen] = useState(false);
     const [infoModalOpen, setInfoModalOpen] = useState(false);
 
-    const [selectedVideo, setSelectedVideo] = useState<Video | null>(null);
+    const [selectedVideo, setSelectedVideo] = useState<VideoInfo | null>(null);
     const [uploadFile, setUploadFile] = useState<File | null>(null);
     const [uploadName, setUploadName] = useState('');
-    const [streamInfo, setStreamInfo] = useState<string | null>(null);
 
-    const fetchVideos = async () => {
+    const navigate = useNavigate();
+
+    const handleVideoUpdate = useCallback((msg: VideoUpdateMessage) => {
+        const videoId = msg.video?.id;
+        if (videoId === undefined) return;
+
+        if (msg.reason === 'deleted') {
+            setVideos(prev => prev.filter(v => v.id !== videoId));
+            setSelectedVideo(prev => (prev?.id === videoId ? null : prev));
+        } else if (msg.video) {
+            setVideos(prev => {
+                const exists = prev.some(v => v.id === videoId);
+                if (exists) {
+                    return prev.map(v => v.id === videoId ? msg.video! : v);
+                }
+                return [...prev, msg.video!];
+            });
+            setSelectedVideo(prev => (prev?.id === videoId ? msg.video! : prev));
+        }
+    }, []);
+
+    useWebSocket({ onVideoUpdate: handleVideoUpdate });
+
+    const fetchVideos = useCallback(async () => {
         try {
             setLoading(true);
             const data = await listVideos();
-            if (Array.isArray(data)) {
-                setVideos(data);
-            } else {
-                console.error('Received invalid videos data:', data);
-                setVideos([]);
-            }
+            setVideos(Array.isArray(data) ? data : []);
         } catch (error) {
             console.error('Failed to fetch videos', error);
             toast.error('Failed to fetch videos');
         } finally {
             setLoading(false);
         }
-    };
+    }, []);
 
     useEffect(() => {
         fetchVideos();
-        const interval = setInterval(fetchVideos, 5000);
-        return () => clearInterval(interval);
-    }, []);
+    }, [fetchVideos]);
 
     // --- Upload Handlers ---
     const openUploadModal = () => {
@@ -64,11 +114,9 @@ export const Management: React.FC = () => {
 
     const handleUploadSubmit = async () => {
         if (!uploadFile) return;
-
         try {
             setUploading(true);
             await uploadVideo(uploadFile, uploadName || uploadFile.name);
-            await fetchVideos();
             toast.success('Video uploaded successfully');
             setUploadModalOpen(false);
         } catch (error) {
@@ -80,7 +128,7 @@ export const Management: React.FC = () => {
     };
 
     // --- Delete Handlers ---
-    const confirmDelete = (video: Video) => {
+    const confirmDelete = (video: VideoInfo) => {
         setSelectedVideo(video);
         setDeleteModalOpen(true);
     };
@@ -89,7 +137,6 @@ export const Management: React.FC = () => {
         if (!selectedVideo) return;
         try {
             await deleteVideo(selectedVideo.id);
-            await fetchVideos();
             toast.success(`Deleted video: ${selectedVideo.name}`);
             setDeleteModalOpen(false);
         } catch (error) {
@@ -102,8 +149,6 @@ export const Management: React.FC = () => {
     const handleStartStream = async (id: number) => {
         try {
             await startStream(id);
-            await fetchVideos();
-            toast.success(`Stream ${id} started`);
         } catch (error) {
             console.error('Start stream failed', error);
             toast.error('Failed to start stream');
@@ -113,35 +158,19 @@ export const Management: React.FC = () => {
     const handleStopStream = async (id: number) => {
         try {
             await stopStream(id);
-            await fetchVideos();
-            toast.success(`Stream ${id} stopped`);
         } catch (error) {
             console.error('Stop stream failed', error);
             toast.error('Failed to stop stream');
         }
     };
 
-    const handleInfo = async (video: Video) => {
-        try {
-            const status = await getStreamStatus(video.id);
-            // We can't store JSX in state easily for the modal content if we want to render it directly, 
-            // but we can store the data and render in the modal.
-            // For simplicity, let's store the status object or render it here.
-            // Actually, let's just set the selected video and fetch in the modal? 
-            // Or better, just set a "modal content" state? 
-            // Let's just use a separate component or render logic.
-            setSelectedVideo(video);
-            // We need the status too.
-            // Let's just cheat and store the JSX in a state for now (not best practice but works)
-            // OR better: create a render function.
-            setStreamInfo(JSON.stringify(status)); // Store raw data
-            setInfoModalOpen(true);
-
-        } catch (error) {
-            console.error('Get info failed', error);
-            toast.error('Failed to get stream info');
-        }
+    const handleInfo = (video: VideoInfo) => {
+        setSelectedVideo(video);
+        setInfoModalOpen(true);
     };
+
+    const activeCount = videos.filter(v => v.stream_status === 'streaming').length;
+    const baseUrl = getBackendUrl();
 
     return (
         <div className="space-y-8">
@@ -180,7 +209,7 @@ export const Management: React.FC = () => {
                     </div>
                     <div>
                         <p className="text-sm text-zinc-400">Active Streams</p>
-                        <p className="text-2xl font-bold text-white">{videos.filter(v => v.is_streaming).length}</p>
+                        <p className="text-2xl font-bold text-white">{activeCount}</p>
                     </div>
                 </div>
             </div>
@@ -208,68 +237,73 @@ export const Management: React.FC = () => {
                                     </td>
                                 </tr>
                             ) : (
-                                videos.map((video) => (
-                                    <tr key={video.id} className="group hover:bg-zinc-800/30 transition-colors">
-                                        <td className="px-6 py-4 font-mono text-sm text-zinc-500">#{video.id}</td>
-                                        <td className="px-6 py-4">
-                                            <span className="font-medium text-zinc-200">{video.name}</span>
-                                        </td>
-                                        <td className="px-6 py-4">
-                                            <span className={clsx(
-                                                "inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border",
-                                                video.is_streaming
-                                                    ? "bg-green-500/10 text-green-400 border-green-500/20"
-                                                    : "bg-zinc-800 text-zinc-400 border-zinc-700"
-                                            )}>
-                                                {video.is_streaming ? (
-                                                    <>
-                                                        <span className="w-1.5 h-1.5 rounded-full bg-green-400 mr-1.5 animate-pulse" />
-                                                        Streaming
-                                                    </>
-                                                ) : 'Stopped'}
-                                            </span>
-                                        </td>
-                                        <td className="px-6 py-4 text-right">
-                                            <div className="flex justify-end items-center space-x-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                                                {video.is_streaming ? (
-                                                    <button
-                                                        onClick={() => handleStopStream(video.id)}
-                                                        className="p-2 text-orange-400 hover:bg-orange-400/10 rounded-lg transition-colors"
-                                                        title="Stop Stream"
-                                                    >
-                                                        <Square className="w-4 h-4" />
-                                                    </button>
-                                                ) : (
-                                                    <button
-                                                        onClick={() => handleStartStream(video.id)}
-                                                        className="p-2 text-green-400 hover:bg-green-400/10 rounded-lg transition-colors"
-                                                        title="Start Stream"
-                                                    >
-                                                        <Play className="w-4 h-4" />
-                                                    </button>
-                                                )}
+                                videos.map((video) => {
+                                    const isStopped = video.stream_status === 'stopped';
+                                    const isStreaming = video.stream_status === 'streaming';
+                                    const isTransitioning = video.stream_status === 'initializing' || video.stream_status === 'terminating';
 
-                                                <button
-                                                    onClick={() => handleInfo(video)}
-                                                    disabled={!video.is_streaming}
-                                                    className="p-2 text-blue-400 hover:bg-blue-400/10 rounded-lg transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-                                                    title="Info"
-                                                >
-                                                    <Info className="w-4 h-4" />
-                                                </button>
+                                    return (
+                                        <tr key={video.id} className="group hover:bg-zinc-800/30 transition-colors">
+                                            <td className="px-6 py-4 font-mono text-sm text-zinc-500">#{video.id}</td>
+                                            <td className="px-6 py-4">
+                                                <span className="font-medium text-zinc-200">{video.name}</span>
+                                            </td>
+                                            <td className="px-6 py-4">
+                                                <StatusBadge status={video.stream_status} />
+                                            </td>
+                                            <td className="px-6 py-4 text-right">
+                                                <div className="flex justify-end items-center space-x-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                                    {isStreaming && (
+                                                        <button
+                                                            onClick={() => navigate(`/viewer?stream_id=${video.id}`)}
+                                                            className="p-2 text-violet-400 hover:bg-violet-400/10 rounded-lg transition-colors"
+                                                            title="Watch Stream"
+                                                        >
+                                                            <Tv className="w-4 h-4" />
+                                                        </button>
+                                                    )}
 
-                                                <button
-                                                    onClick={() => confirmDelete(video)}
-                                                    disabled={video.is_streaming}
-                                                    className="p-2 text-red-400 hover:bg-red-400/10 rounded-lg transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-                                                    title="Delete"
-                                                >
-                                                    <Trash2 className="w-4 h-4" />
-                                                </button>
-                                            </div>
-                                        </td>
-                                    </tr>
-                                ))
+                                                    {isStopped ? (
+                                                        <button
+                                                            onClick={() => handleStartStream(video.id)}
+                                                            className="p-2 text-green-400 hover:bg-green-400/10 rounded-lg transition-colors"
+                                                            title="Start Stream"
+                                                        >
+                                                            <Play className="w-4 h-4" />
+                                                        </button>
+                                                    ) : (
+                                                        <button
+                                                            onClick={() => handleStopStream(video.id)}
+                                                            disabled={isTransitioning}
+                                                            className="p-2 text-orange-400 hover:bg-orange-400/10 rounded-lg transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                                                            title="Stop Stream"
+                                                        >
+                                                            <Square className="w-4 h-4" />
+                                                        </button>
+                                                    )}
+
+                                                    <button
+                                                        onClick={() => handleInfo(video)}
+                                                        disabled={!isStreaming}
+                                                        className="p-2 text-blue-400 hover:bg-blue-400/10 rounded-lg transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                                                        title="Stream Info"
+                                                    >
+                                                        <Info className="w-4 h-4" />
+                                                    </button>
+
+                                                    <button
+                                                        onClick={() => confirmDelete(video)}
+                                                        disabled={!isStopped}
+                                                        className="p-2 text-red-400 hover:bg-red-400/10 rounded-lg transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                                                        title="Delete"
+                                                    >
+                                                        <Trash2 className="w-4 h-4" />
+                                                    </button>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    );
+                                })
                             )}
                         </tbody>
                     </table>
@@ -352,42 +386,59 @@ export const Management: React.FC = () => {
                     <button onClick={() => setInfoModalOpen(false)} className="btn btn-secondary">Close</button>
                 }
             >
-                {streamInfo && (() => {
-                    const status = JSON.parse(streamInfo);
-                    return (
-                        <div className="space-y-4 text-sm">
-                            <div className="grid grid-cols-3 gap-y-3 gap-x-2">
-                                <span className="text-zinc-500">Stream ID:</span>
-                                <span className="col-span-2 font-mono text-white">{selectedVideo?.id}</span>
+                {selectedVideo && (
+                    <div className="space-y-4 text-sm">
+                        <div className="grid grid-cols-3 gap-y-3 gap-x-2">
+                            <span className="text-zinc-500">Video ID:</span>
+                            <span className="col-span-2 font-mono text-white">#{selectedVideo.id}</span>
 
-                                <span className="text-zinc-500">Status:</span>
-                                <span className={clsx("col-span-2 font-medium", status.is_streaming ? "text-green-400" : "text-red-400")}>
-                                    {status.is_streaming ? 'Streaming' : 'Stopped'}
-                                </span>
+                            <span className="text-zinc-500">Name:</span>
+                            <span className="col-span-2 text-white">{selectedVideo.name}</span>
 
-                                <span className="text-zinc-500">Started:</span>
-                                <span className="col-span-2 text-white">
-                                    {status.stream_start_time_ms ? new Date(status.stream_start_time_ms).toLocaleString() : 'N/A'}
-                                </span>
+                            <span className="text-zinc-500">Resolution:</span>
+                            <span className="col-span-2 font-mono text-white">{selectedVideo.width}×{selectedVideo.height} @ {selectedVideo.fps.toFixed(2)} fps</span>
+
+                            <span className="text-zinc-500">Status:</span>
+                            <span className="col-span-2"><StatusBadge status={selectedVideo.stream_status} /></span>
+
+                            {selectedVideo.stream_start_time_ms && (
+                                <>
+                                    <span className="text-zinc-500">Started:</span>
+                                    <span className="col-span-2 text-white">
+                                        {new Date(selectedVideo.stream_start_time_ms).toLocaleString()}
+                                    </span>
+                                </>
+                            )}
+                        </div>
+
+                        <div className="bg-zinc-950 p-4 rounded-lg border border-border space-y-3">
+                            <div>
+                                <p className="text-xs uppercase tracking-wider text-zinc-500 font-semibold mb-1">DASH Manifest</p>
+                                <p className="font-mono text-xs text-blue-400 break-all select-all bg-zinc-900/50 p-2 rounded">
+                                    {selectedVideo.dash_manifest_url
+                                        ? `${baseUrl}${selectedVideo.dash_manifest_url}`
+                                        : 'N/A'}
+                                </p>
                             </div>
-
-                            <div className="bg-zinc-950 p-4 rounded-lg border border-border space-y-3">
-                                <div>
-                                    <p className="text-xs uppercase tracking-wider text-zinc-500 font-semibold mb-1">DASH URL</p>
-                                    <p className="font-mono text-xs text-blue-400 break-all select-all bg-zinc-900/50 p-2 rounded">
-                                        {status.dash?.manifest_url || 'N/A'}
-                                    </p>
-                                </div>
-                                <div>
-                                    <p className="text-xs uppercase tracking-wider text-zinc-500 font-semibold mb-1">TCP Port</p>
-                                    <div className="font-mono text-sm text-zinc-300 bg-zinc-900/50 px-2 py-1 rounded border border-zinc-800 inline-block">
-                                        {status.relay?.port || 'N/A'}
-                                    </div>
-                                </div>
+                            <div>
+                                <p className="text-xs uppercase tracking-wider text-zinc-500 font-semibold mb-1">Progressive Init</p>
+                                <p className="font-mono text-xs text-blue-400 break-all select-all bg-zinc-900/50 p-2 rounded">
+                                    {selectedVideo.prog_init_url
+                                        ? `${baseUrl}${selectedVideo.prog_init_url}`
+                                        : 'N/A'}
+                                </p>
+                            </div>
+                            <div>
+                                <p className="text-xs uppercase tracking-wider text-zinc-500 font-semibold mb-1">Progressive Stream</p>
+                                <p className="font-mono text-xs text-blue-400 break-all select-all bg-zinc-900/50 p-2 rounded">
+                                    {selectedVideo.prog_url
+                                        ? `${baseUrl}${selectedVideo.prog_url}`
+                                        : 'N/A'}
+                                </p>
                             </div>
                         </div>
-                    );
-                })()}
+                    </div>
+                )}
             </Modal>
         </div>
     );

@@ -1,83 +1,105 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { getBackendUrl } from '../api/client';
-import type { BBoxMessage } from '../types';
+import type { BBoxMessage, VideoUpdateMessage } from '../types';
 
-export const useWebSocket = (videoId: number | null, onDisconnect?: () => void) => {
+interface UseWebSocketOptions {
+    onVideoUpdate?: (msg: VideoUpdateMessage) => void;
+}
+
+export const useWebSocket = (options: UseWebSocketOptions = {}) => {
     const [isConnected, setIsConnected] = useState(false);
-    const [error, setError] = useState<string | null>(null);
     const wsRef = useRef<WebSocket | null>(null);
     const bboxBufferRef = useRef<BBoxMessage[]>([]);
+    const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const mountedRef = useRef(true);
+    const onVideoUpdateRef = useRef(options.onVideoUpdate);
+
+    useEffect(() => {
+        onVideoUpdateRef.current = options.onVideoUpdate;
+    }, [options.onVideoUpdate]);
 
     const connect = useCallback(() => {
-        if (videoId === null) return;
+        if (!mountedRef.current) return;
 
         const backendUrl = getBackendUrl();
-        const wsUrl = backendUrl.replace(/^http/, 'ws').replace(/^https/, 'wss') + `/ws/${videoId}`;
+        const wsUrl = backendUrl.replace(/^http/, 'ws').replace(/^https/, 'wss') + '/ws';
 
         const ws = new WebSocket(wsUrl);
+        wsRef.current = ws;
 
         ws.onopen = () => {
+            if (!mountedRef.current) return;
             setIsConnected(true);
-            setError(null);
+            if (reconnectTimeoutRef.current) {
+                clearTimeout(reconnectTimeoutRef.current);
+                reconnectTimeoutRef.current = null;
+            }
         };
 
         ws.onmessage = (event) => {
             try {
                 const data = JSON.parse(event.data);
 
-                if (data.type === 'bboxes') {
-                    // Add to buffer
-                    // We keep a buffer of recent messages to sync with video
-                    bboxBufferRef.current.push(data);
-
-                    // Limit buffer size (e.g., keep last 500 messages)
+                if (data.type === 'bbox_update') {
+                    bboxBufferRef.current.push(data as BBoxMessage);
                     if (bboxBufferRef.current.length > 500) {
                         bboxBufferRef.current.shift();
                     }
-                } else if (data.type === 'stream_info') {
-                    // Stream info received
-                } else if (data.type === 'pong') {
-                    // Heartbeat response
-                } else if (data.type === 'error') {
-                    console.error('WebSocket Error Message:', data.message);
+                } else if (data.type === 'video_update') {
+                    onVideoUpdateRef.current?.(data as VideoUpdateMessage);
                 }
+                // pong handled implicitly
             } catch (e) {
-                console.error('Failed to parse WebSocket message', e, event.data);
+                console.error('Failed to parse WebSocket message', e);
             }
         };
 
-        ws.onerror = (e) => {
-            console.error('WebSocket Error:', e);
-            setError('Connection failed');
+        ws.onerror = () => {
+            setIsConnected(false);
         };
 
         ws.onclose = () => {
+            if (!mountedRef.current) return;
             setIsConnected(false);
-            if (onDisconnect) onDisconnect();
+            reconnectTimeoutRef.current = setTimeout(() => {
+                if (mountedRef.current) connect();
+            }, 2000);
         };
+    }, []);
 
-        wsRef.current = ws;
-    }, [videoId, onDisconnect]);
+    const subscribe = useCallback((videoId: number) => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({ type: 'subscribe_video', video_id: videoId }));
+        }
+    }, []);
+
+    const unsubscribe = useCallback((videoId: number) => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({ type: 'unsubscribe_video', video_id: videoId }));
+        }
+        bboxBufferRef.current = [];
+    }, []);
 
     useEffect(() => {
-        if (videoId !== null) {
-            connect();
-        }
-
+        mountedRef.current = true;
+        connect();
         return () => {
+            mountedRef.current = false;
+            if (reconnectTimeoutRef.current) {
+                clearTimeout(reconnectTimeoutRef.current);
+            }
             if (wsRef.current) {
-                // Prevent triggering onDisconnect during manual cleanup
                 wsRef.current.onclose = null;
                 wsRef.current.close();
                 wsRef.current = null;
             }
-            bboxBufferRef.current = [];
         };
-    }, [videoId, connect]);
+    }, [connect]);
 
     return {
         isConnected,
-        error,
         bboxBuffer: bboxBufferRef,
+        subscribe,
+        unsubscribe,
     };
 };

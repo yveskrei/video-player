@@ -1,21 +1,18 @@
 import { apiClient } from './client';
-import type { Video, StreamStatus } from '../types';
+import type { VideoInfo } from '../types';
 
-export const listVideos = async (): Promise<Video[]> => {
-    const response = await apiClient.get<Video[]>('/videos/');
+export const listVideos = async (): Promise<VideoInfo[]> => {
+    const response = await apiClient.get<VideoInfo[]>('/videos/');
     return response.data;
 };
 
-export const uploadVideo = async (file: File, name: string): Promise<Video> => {
+export const uploadVideo = async (file: File, name: string): Promise<void> => {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('name', name);
-    const response = await apiClient.post<Video>('/videos/upload', formData, {
-        headers: {
-            'Content-Type': 'multipart/form-data',
-        },
+    await apiClient.post('/videos/upload', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
     });
-    return response.data;
 };
 
 export const deleteVideo = async (videoId: number): Promise<void> => {
@@ -28,9 +25,4 @@ export const startStream = async (videoId: number): Promise<void> => {
 
 export const stopStream = async (videoId: number): Promise<void> => {
     await apiClient.post(`/streams/stop/${videoId}`);
-};
-
-export const getStreamStatus = async (videoId: number): Promise<StreamStatus> => {
-    const response = await apiClient.get<StreamStatus>(`/streams/status/${videoId}`);
-    return response.data;
 };

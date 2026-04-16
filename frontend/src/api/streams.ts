@@ -1,5 +1,5 @@
 import { apiClient } from './client';
-import type { VideoInfo } from '../types';
+import type { VideoInfo, BBoxHistoryResponse } from '../types';
 
 export const listVideos = async (): Promise<VideoInfo[]> => {
     const response = await apiClient.get<VideoInfo[]>('/videos/');
@@ -25,4 +25,9 @@ export const startStream = async (videoId: number): Promise<void> => {
 
 export const stopStream = async (videoId: number): Promise<void> => {
     await apiClient.post(`/streams/stop/${videoId}`);
+};
+
+export const listBboxes = async (videoId: number): Promise<BBoxHistoryResponse> => {
+    const response = await apiClient.get<BBoxHistoryResponse>(`/bboxes/${videoId}`);
+    return response.data;
 };

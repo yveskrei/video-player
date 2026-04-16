@@ -1,5 +1,4 @@
 from fastapi import APIRouter
-from fastapi.responses import Response
 from models import BBoxCreate
 from bbox_manager import BBoxManager
 from websocket_manager import manager as ws_manager
@@ -7,11 +6,19 @@ from websocket_manager import manager as ws_manager
 router = APIRouter(prefix="/bboxes", tags=["bboxes"])
 
 
-@router.post("/", status_code=204)
+@router.post("/")
 async def add_bboxes(bbox_data: BBoxCreate):
-    """Add bounding boxes and broadcast to subscribed WebSocket clients."""
-    await BBoxManager.add_bboxes(bbox_data, websocket_manager=ws_manager)
-    return Response(status_code=204)
+    """Add bounding boxes, broadcast to subscribed WebSocket clients, and
+    return the stored bboxes (each annotated with absolute_timestamp_ms) so
+    clients such as the FFI library can echo them back through their own
+    PostResultsCallback with real-world timestamps already computed."""
+    return await BBoxManager.add_bboxes(bbox_data, websocket_manager=ws_manager)
+
+
+@router.get("/{video_id}")
+def list_bboxes(video_id: int):
+    """Return all retained bboxes for a video (the DVR window history)."""
+    return BBoxManager.list_bboxes(video_id)
 
 
 @router.post("/cleanup")

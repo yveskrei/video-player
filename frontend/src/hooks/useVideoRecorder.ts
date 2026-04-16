@@ -9,6 +9,7 @@ interface UseVideoRecorderProps {
     originalWidth: number;
     originalHeight: number;
     minConfidence: number;
+    enabled: boolean;
 }
 
 export const useVideoRecorder = ({
@@ -16,7 +17,8 @@ export const useVideoRecorder = ({
     bboxes,
     originalWidth,
     originalHeight,
-    minConfidence
+    minConfidence,
+    enabled,
 }: UseVideoRecorderProps) => {
     const [isRecording, setIsRecording] = useState(false);
     const [recordingDuration, setRecordingDuration] = useState(0);
@@ -55,6 +57,10 @@ export const useVideoRecorder = ({
 
     // Auto-start recording when video dimensions are available
     useEffect(() => {
+        if (!enabled) {
+            cleanup();
+            return;
+        }
         if (!videoRef.current || originalWidth === 0 || originalHeight === 0) return;
 
         // If already recording with same dimensions, skip
@@ -207,7 +213,7 @@ export const useVideoRecorder = ({
         return () => {
             // Cleanup handled by parent effect dependency change or unmount calling cleanup()
         };
-    }, [originalWidth, originalHeight, videoRef, cleanup, isRecording, minConfidence]);
+    }, [originalWidth, originalHeight, videoRef, cleanup, isRecording, minConfidence, enabled]);
 
     // Ref for latest bboxes
     const latestBBoxes = useRef(bboxes);

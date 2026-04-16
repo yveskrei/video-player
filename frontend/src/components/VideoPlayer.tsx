@@ -6,83 +6,69 @@ interface VideoPlayerProps {
     manifestUrl: string;
     onResolutionChange: (width: number, height: number) => void;
     onError?: (error: string) => void;
+    onPlayerReady?: (player: dashjs.MediaPlayerClass) => void;
 }
 
-export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(({ manifestUrl, onResolutionChange, onError }, ref) => {
+export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(({ manifestUrl, onResolutionChange, onError, onPlayerReady }, ref) => {
     const videoRef = useRef<HTMLVideoElement>(null);
     const playerRef = useRef<dashjs.MediaPlayerClass | null>(null);
+    const onPlayerReadyRef = useRef(onPlayerReady);
 
     useImperativeHandle(ref, () => videoRef.current!);
 
     useEffect(() => {
+        onPlayerReadyRef.current = onPlayerReady;
+    }, [onPlayerReady]);
+
+    useEffect(() => {
         if (!manifestUrl || !videoRef.current) return;
 
-        // Prevent re-initialization if player already exists for this manifest
-        if (playerRef.current) {
-            return;
-        }
+        if (playerRef.current) return;
 
         const player = dashjs.MediaPlayer().create();
-        player.clearDefaultUTCTimingSources();
 
-        // Configure for low-latency live streaming
         player.updateSettings({
             streaming: {
-                utcSynchronization: {
-                    enabled: false
-                },
-                delay: {
-                    liveDelay: 6.0 // Increased to 6.0s (3 segments) for stability
-                },
+                // UTC sync is required so dash.js exposes the full DVR window as seekable;
+                // without it, video.seekable stays pinned to the buffered region (~6s at live),
+                // which silently clamps any past-seek back to the live edge.
+                utcSynchronization: { enabled: true },
+                delay: { liveDelay: 6.0 },
                 liveCatchup: {
                     mode: 'liveCatchupModeDefault',
-                    enabled: false, // Disabled to prevent speed-up/high FPS
+                    enabled: false,
                     maxDrift: 0,
-                    playbackRate: {
-                        min: 0,
-                        max: 0
-                    }
+                    playbackRate: { min: 0, max: 0 }
                 },
-                manifestUpdateRetryInterval: 1000, // Check for manifest updates every 1 second
-                retryIntervals: {
-                    MPD: 1000, // Retry MPD download every 1s if failed
-                },
-                retryAttempts: {
-                    MPD: 2, // Give up after 2 retries
-                },
-                abr: {
-                    limitBitrateByPortal: true,
-                },
+                manifestUpdateRetryInterval: 1000,
+                retryIntervals: { MPD: 1000 },
+                retryAttempts: { MPD: 2 },
+                abr: { limitBitrateByPortal: true },
                 buffer: {
                     bufferTimeAtTopQuality: 30,
                     bufferTimeAtTopQualityLongForm: 60,
-                    bufferToKeep: 20,      // Keep 20 seconds behind playhead
-                    fastSwitchEnabled: true
+                    bufferToKeep: 20,
+                    fastSwitchEnabled: true,
                 }
             }
         });
 
         player.initialize(videoRef.current, manifestUrl, true);
         playerRef.current = player;
+        onPlayerReadyRef.current?.(player);
 
-        // Error handling
         player.on(dashjs.MediaPlayer.events.ERROR, (e: any) => {
-            // Only toast critical errors to avoid spam
             if (e.error === 'capability' || e.error === 'mediasource' || e.error === 'key_session') {
                 toast.error(`Playback Error: ${e.event ? e.event.message : 'Unknown error'}`);
             } else {
-                // Log other errors for debugging
                 console.error('Dash.js Error:', e);
             }
 
-            // Handle stream end (404 on manifest update usually means stream stopped)
-            // Broadened check: any download error
             if (e.error === 'download') {
                 if (onError) onError('Stream stopped');
             }
         });
 
-        // Handle resolution changes
         const handleResize = () => {
             if (videoRef.current) {
                 onResolutionChange(videoRef.current.videoWidth, videoRef.current.videoHeight);
@@ -93,13 +79,11 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(({ man
         videoRef.current.addEventListener('resize', handleResize);
 
         return () => {
-            // Proper cleanup sequence to avoid DOMException
             if (videoRef.current) {
                 videoRef.current.removeEventListener('loadedmetadata', handleResize);
                 videoRef.current.removeEventListener('resize', handleResize);
             }
 
-            // Reset player before destroying
             if (playerRef.current) {
                 try {
                     playerRef.current.reset();
@@ -109,7 +93,7 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(({ man
                 playerRef.current = null;
             }
         };
-    }, [manifestUrl]); // Only re-run when manifestUrl changes
+    }, [manifestUrl]);
 
     return (
         <video

@@ -36,3 +36,19 @@ export interface VideoUpdateMessage {
     reason: 'created' | 'deleted' | 'stream_initializing' | 'stream_started' | 'stream_stopped' | 'stream_error';
     video?: VideoInfo & { id: number };
 }
+
+export interface BBoxGroup {
+    pts: number;
+    bboxes: BBox[];
+}
+
+export interface BBoxHistoryResponse {
+    video_id: number;
+    stream_start_time_ms: number | null;
+    groups: BBoxGroup[];
+}
+
+export interface ClipSelection {
+    startPts: number;
+    endPts: number;
+}

@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 DASH_OUTPUT_DIR = Path("./dash_streams")
 PROGRESSIVE_OUTPUT_DIR = Path("./progressive_streams")
 DASH_SEGMENT_DURATION = 2   # seconds
-DASH_WINDOW_SIZE = 5
+DASH_WINDOW_SIZE = 150      # 150 × 2s = 300s DVR window
 INIT_TIMEOUT = 10           # seconds to wait for DASH manifest
 
 
@@ -392,10 +392,12 @@ class StreamManager:
                 "-f", "dash",
                 "-seg_duration", str(DASH_SEGMENT_DURATION),
                 "-window_size", str(DASH_WINDOW_SIZE),
-                "-extra_window_size", str(DASH_WINDOW_SIZE),
+                "-extra_window_size", "5",
                 "-remove_at_exit", "1",
                 "-streaming", "1",
                 "-ldash", "1",
+                "-use_template", "1",
+                "-use_timeline", "1",
                 str(dash_dir / "manifest.mpd"),
 
                 # --- Progressive fMP4 → stdout ---

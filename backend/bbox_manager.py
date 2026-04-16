@@ -29,8 +29,10 @@ class BBoxManager:
             del storage.bboxes[video_id][pts]
 
     @staticmethod
-    async def add_bboxes(bbox_data: BBoxCreate, websocket_manager=None) -> None:
-        """Store bounding boxes and broadcast them to subscribed WebSocket clients."""
+    async def add_bboxes(bbox_data: BBoxCreate, websocket_manager=None) -> dict:
+        """Store bounding boxes, broadcast to subscribers, and return the stored
+        bboxes (with per-bbox absolute_timestamp_ms) so the ingesting client
+        can attach real-world timestamps to its own bookkeeping."""
         video_id = bbox_data.stream_id
 
         if video_id not in storage.videos:
@@ -45,6 +47,7 @@ class BBoxManager:
 
         current_time_ms = int(time.time() * 1000)
         pts_groups: dict = {}
+        stored_bboxes: list = []
 
         for bbox in bbox_data.bboxes:
             pts = bbox.pts
@@ -63,6 +66,7 @@ class BBoxManager:
                 "confidence": bbox.confidence,
             }
             storage.bboxes[video_id][pts].append(bbox_dict)
+            stored_bboxes.append(bbox_dict)
 
             if pts not in pts_groups:
                 pts_groups[pts] = []
@@ -80,6 +84,34 @@ class BBoxManager:
                     "stream_start_time_ms": stream_start_time_ms,
                     "timestamp": current_time_ms,
                 })
+
+        return {
+            "source_id": video_id,
+            "stream_start_time_ms": stream_start_time_ms,
+            "bboxes": stored_bboxes,
+        }
+
+    @staticmethod
+    def list_bboxes(video_id: int) -> list:
+        """Return all retained bboxes for a video, sorted by pts ascending."""
+        if video_id not in storage.videos:
+            raise HTTPException(404, f"Video {video_id} not found")
+
+        stream = storage.active_streams.get(video_id)
+        stream_start_time_ms = stream["start_time_ms"] if stream else None
+
+        groups = storage.bboxes.get(video_id, {})
+        result = []
+        for pts in sorted(groups.keys()):
+            result.append({
+                "pts": pts,
+                "bboxes": groups[pts],
+            })
+        return {
+            "video_id": video_id,
+            "stream_start_time_ms": stream_start_time_ms,
+            "groups": result,
+        }
 
     @staticmethod
     def cleanup_all_old_bboxes() -> dict:

@@ -40,3 +40,10 @@
     @apply bg-zinc-950 border border-border rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all;
   }
 }
+
+@keyframes skipFade {
+  0%   { opacity: 0;   transform: translateY(-50%) scale(0.85); }
+  18%  { opacity: 0.9; transform: translateY(-50%) scale(1);    }
+  75%  { opacity: 0.9; transform: translateY(-50%) scale(1);    }
+  100% { opacity: 0;   transform: translateY(-50%) scale(1.05); }
+}

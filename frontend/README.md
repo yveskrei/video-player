@@ -15,7 +15,7 @@ Modern React-based video streaming application with real-time bounding box overl
 ### 1. Install Dependencies
 
 ```bash
-npm install
+bun install
 ```
 
 ### 2. Configure Environment
@@ -35,7 +35,7 @@ VITE_BACKEND_URL=http://localhost:8702
 ### 3. Run Development Server
 
 ```bash
-npm run dev
+bun run dev
 ```
 
 The app will be available at `http://localhost:5173`
@@ -43,7 +43,7 @@ The app will be available at `http://localhost:5173`
 ### 4. Build for Production
 
 ```bash
-npm run build
+bun run build
 ```
 
 The built files will be in the `dist/` directory.

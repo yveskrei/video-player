@@ -12,7 +12,7 @@
   "dependencies": {
     "axios": "^1.13.2",
     "clsx": "^2.1.1",
-    "dashjs": "^5.0.3",
+    "dashjs": "^5.1.1",
     "lucide-react": "^0.554.0",
     "mp4-muxer": "^5.2.2",
     "mp4box": "^2.3.0",

@@ -46,10 +46,12 @@ Thumbs.db
 # UV files
 *uv.lock
 
-# NPM
+# Bun / NPM
 *node_modules/
 *package-lock.json
 *yarn.lock
+*bun.lock
+*bun.lockb
 
 # Temporary files
 *.tmp

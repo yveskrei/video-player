@@ -5,7 +5,7 @@ cd ./backend && uv run uvicorn main:app --reload --host 0.0.0.0 --port 8702 &
 BACKEND_PID=$!
 
 # Run frontend in dev mode
-cd frontend && npm run dev &
+cd frontend && bun run dev &
 FRONTEND_PID=$!
 
 # Define cleanup function

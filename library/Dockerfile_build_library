@@ -35,5 +35,4 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
 # Verify installation
 RUN rustc --version && cargo --version
 
-# Set workdir in dedicated folder
-WORKDIR /app/
+# Set workdir in dedica

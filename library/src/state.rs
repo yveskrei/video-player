@@ -1,21 +1,23 @@
 //! Shared singleton owning the tokio runtime, player proxy, active sources and callbacks.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Once};
+use std::ffi::CString;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use tokio::runtime::Runtime;
 use tokio::sync::OnceCell;
+use tracing::warn;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
 use crate::callbacks::Callbacks;
+use crate::decoder::{DecodedFrame, StreamMetadata};
 use crate::player_api::PlayerApi;
-use crate::source::Source;
+use crate::source::{Source, SourceStatus};
 
 static STATE: OnceCell<Arc<State>> = OnceCell::const_new();
-static SERVICES_INIT: Once = Once::new();
 
 pub struct State {
     player_api: Arc<PlayerApi>,
@@ -26,7 +28,19 @@ pub struct State {
 
 impl State {
     pub fn new() -> Result<Self> {
-        init_services();
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("ffi_library=info,warn"));
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                fmt::layer()
+                    .json()
+                    .with_target(true)
+                    .with_current_span(false),
+            )
+            .try_init();
+        let _ = ffmpeg_next::init();
+
         let runtime = Runtime::new().context("building tokio runtime")?;
         let player_api = PlayerApi::new().context("building player api")?;
         Ok(Self {
@@ -78,21 +92,38 @@ impl State {
     }
 }
 
-fn init_services() {
-    SERVICES_INIT.call_once(|| {
-        let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("ffi_library=info,warn"));
-        let _ = tracing_subscriber::registry()
-            .with(filter)
-            .with(
-                fmt::layer()
-                    .json()
-                    .with_target(true)
-                    .with_current_span(false),
-            )
-            .try_init();
-        let _ = ffmpeg_next::init();
-    });
+impl State {
+    pub fn trigger_status(&self, source_id: i32, status: SourceStatus) {
+        if let Some(cb) = self.callbacks() {
+            (cb.status)(source_id, status.as_i32());
+        }
+    }
+
+    pub fn trigger_frame(&self, source_id: i32, frame: &DecodedFrame) {
+        if let Some(cb) = self.callbacks() {
+            (cb.frames)(source_id, frame.rgb.as_ptr(), frame.width, frame.height, frame.pts_90k);
+        }
+    }
+
+    pub fn trigger_metadata(&self, source_id: i32, meta: StreamMetadata, stream_name: &str) {
+        let Some(cb) = self.callbacks() else { return };
+        let cname = CString::new(stream_name).unwrap_or_default();
+        let raw = cname.into_raw();
+        (cb.metadata)(source_id, meta.width, meta.height, meta.fps.round() as i32, raw as *const _);
+    }
+
+    pub fn trigger_post_results(&self, source_id: i32, body: &str) {
+        let Some(cb) = self.callbacks() else { return };
+        let cbody = match CString::new(body) {
+            Ok(s) => s,
+            Err(_) => {
+                warn!(source_id, "post-results body contained NUL; skipped");
+                return;
+            }
+        };
+        let raw = cbody.into_raw();
+        (cb.post_results)(source_id, raw as *const _);
+    }
 }
 
 pub fn get_state() -> Result<Arc<State>> {

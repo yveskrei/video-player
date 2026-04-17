@@ -22,7 +22,7 @@ Install and start backend component:
 cd backend && uv sync
 
 # Frontend setup
-cd frontend && npm install
+cd frontend && bun install
 ```
 
 Start a development environment(unified for frontend and backend):

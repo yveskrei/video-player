@@ -35,10 +35,3 @@ After building the dependencies(Done only once), you can build the library by ru
 ```bash
 ./build_library.sh
 ``` 
-
-The script `build_library.sh` will compile the Rust code and generate a shared object file (`.so`) that can be used in your application. The resulting `.so` file will be located in the `target/release` directory.
-The library requires the following environment variable to connect to the backend:
-
-```bash
-export PLAYER_BACKEND_URL="http://127.0.0.1:8702"
-```

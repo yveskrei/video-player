@@ -266,7 +266,15 @@ class StreamManager:
         )
         stdout_reader.start()
 
-        # --- Phase 1: INITIALIZING — poll for DASH manifest ---
+        # --- Phase 1: INITIALIZING — poll for DASH manifest + enough segments ---
+        # Don't transition to STREAMING until at least MIN_READY_SEGMENTS media
+        # segments (chunk-*.m4s) exist. A dash.js 5.1.1 race in
+        # StreamController._composePeriods crashes playback when the manifest is too
+        # fresh: `stream.initialize()` can't populate its adapter's RegularPeriods
+        # from a one-segment MPD in time, so addDVRMetric silently fails and the
+        # player never fires STREAMS_COMPOSED. Requiring 3 segments guarantees
+        # ffmpeg has rewritten the MPD at least twice with a real segment timeline.
+        MIN_READY_SEGMENTS = 3
         stream = storage.active_streams.get(video_id)
         if stream and stream["status"] == StreamStatus.INITIALIZING:
             deadline = time.time() + INIT_TIMEOUT
@@ -279,7 +287,11 @@ class StreamManager:
                     if stream:
                         stream["status"] = StreamStatus.TERMINATING
                     break
+                ready = False
                 if dash_manifest.exists():
+                    segment_count = sum(1 for _ in dash_manifest.parent.glob("chunk-*.m4s"))
+                    ready = segment_count >= MIN_READY_SEGMENTS
+                if ready:
                     stream["status"] = StreamStatus.STREAMING
                     logger.info(f"[Stream {video_id}] → STREAMING")
                     broadcast_sync(
@@ -293,7 +305,7 @@ class StreamManager:
                 time.sleep(0.5)
             else:
                 # Loop exhausted — timeout
-                logger.error(f"[Stream {video_id}] Initialization timeout — no manifest after {INIT_TIMEOUT}s")
+                logger.error(f"[Stream {video_id}] Initialization timeout — no manifest/segments after {INIT_TIMEOUT}s")
                 stream = storage.active_streams.get(video_id)
                 if stream and stream["status"] == StreamStatus.INITIALIZING:
                     stream["status"] = StreamStatus.TERMINATING

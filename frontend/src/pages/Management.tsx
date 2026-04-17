@@ -46,6 +46,7 @@ export const Management: React.FC = () => {
     const [videos, setVideos] = useState<VideoInfo[]>([]);
     const [loading, setLoading] = useState(false);
     const [uploading, setUploading] = useState(false);
+    const [uploadProgress, setUploadProgress] = useState(0);
 
     const [uploadModalOpen, setUploadModalOpen] = useState(false);
     const [deleteModalOpen, setDeleteModalOpen] = useState(false);
@@ -116,7 +117,8 @@ export const Management: React.FC = () => {
         if (!uploadFile) return;
         try {
             setUploading(true);
-            await uploadVideo(uploadFile, uploadName || uploadFile.name);
+            setUploadProgress(0);
+            await uploadVideo(uploadFile, uploadName || uploadFile.name, setUploadProgress);
             toast.success('Video uploaded successfully');
             setUploadModalOpen(false);
         } catch (error) {
@@ -124,6 +126,7 @@ export const Management: React.FC = () => {
             toast.error('Failed to upload video');
         } finally {
             setUploading(false);
+            setUploadProgress(0);
         }
     };
 
@@ -325,7 +328,11 @@ export const Management: React.FC = () => {
                             disabled={!uploadFile || uploading}
                             className="btn btn-primary"
                         >
-                            {uploading ? 'Uploading...' : 'Upload'}
+                            {uploading
+                                ? uploadProgress >= 1
+                                    ? 'Processing…'
+                                    : `Uploading ${Math.round(uploadProgress * 100)}%`
+                                : 'Upload'}
                         </button>
                     </>
                 }
@@ -356,6 +363,21 @@ export const Management: React.FC = () => {
                             className="input w-full"
                         />
                     </div>
+                    {uploading && (
+                        <div>
+                            <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-800">
+                                <div
+                                    className="h-full bg-primary transition-[width] duration-100"
+                                    style={{ width: `${Math.round(uploadProgress * 100)}%` }}
+                                />
+                            </div>
+                            <p className="mt-2 text-xs text-zinc-500">
+                                {uploadProgress >= 1
+                                    ? 'Upload complete — analyzing video on server…'
+                                    : `${Math.round(uploadProgress * 100)}% uploaded`}
+                            </p>
+                        </div>
+                    )}
                 </div>
             </Modal>
 

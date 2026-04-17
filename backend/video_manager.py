@@ -5,6 +5,8 @@ from storage import storage
 from models import VideoInfo
 from enums import StreamStatus, VideoUpdateReason
 from websocket_manager import manager as ws_manager, broadcast_sync
+import asyncio
+import shutil
 import subprocess
 import json
 import logging
@@ -95,14 +97,18 @@ class VideoManager:
         file_path = storage.video_storage_path / f"{video_id}.mp4"
 
         try:
-            with open(file_path, "wb") as f:
-                content = await file.read()
-                f.write(content)
+            # Stream the upload to disk in a worker thread so we don't buffer
+            # the whole file in RAM and don't block the event loop while writing.
+            def _copy_upload():
+                with open(file_path, "wb") as f:
+                    shutil.copyfileobj(file.file, f, length=1024 * 1024)
+            await asyncio.to_thread(_copy_upload)
         except Exception as e:
             raise HTTPException(500, f"Failed to save file: {e}")
 
         try:
-            properties = VideoManager._get_video_properties(str(file_path))
+            # ffprobe is a blocking subprocess — run it off the event loop.
+            properties = await asyncio.to_thread(VideoManager._get_video_properties, str(file_path))
         except ValueError as e:
             if file_path.exists():
                 file_path.unlink()

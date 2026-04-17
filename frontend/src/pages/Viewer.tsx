@@ -195,6 +195,8 @@ export const Viewer: React.FC = () => {
     // Stream selection / historical bbox hydration
     // -------------------------------------------------------------------
 
+    const autoSelectedRef = useRef(false);
+
     const handleStreamSelect = useCallback(async (id: number) => {
         const stream = streams.find(s => s.id === id);
         if (!stream?.dash_manifest_url) {
@@ -206,6 +208,7 @@ export const Viewer: React.FC = () => {
             unsubscribe(selectedStreamIdRef.current);
         }
 
+        autoSelectedRef.current = true;
         setSelectedStreamId(id);
         setManifestUrl(stream.dash_manifest_url);
         setBboxGroups(new Map());
@@ -232,7 +235,6 @@ export const Viewer: React.FC = () => {
         handleStopWatching();
     }, [unsubscribe, handleStopWatching]);
 
-    const autoSelectedRef = useRef(false);
     useEffect(() => {
         if (autoSelectedRef.current || !autoStreamId || selectedStreamId !== null) return;
         const stream = streams.find(s => s.id === autoStreamId);
@@ -569,10 +571,12 @@ export const Viewer: React.FC = () => {
                         </p>
                     </div>
                 ) : (
-                    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-                        {streams.map(s => (
-                            <StreamCard key={s.id} stream={s} onSelect={handleStreamSelect} />
-                        ))}
+                    <div className="card p-4">
+                        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                            {streams.map(s => (
+                                <StreamCard key={s.id} stream={s} onSelect={handleStreamSelect} />
+                            ))}
+                        </div>
                     </div>
                 )}
             </div>

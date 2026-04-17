@@ -6,12 +6,24 @@ export const listVideos = async (): Promise<VideoInfo[]> => {
     return response.data;
 };
 
-export const uploadVideo = async (file: File, name: string): Promise<void> => {
+export const uploadVideo = async (
+    file: File,
+    name: string,
+    onProgress?: (fraction: number) => void,
+): Promise<void> => {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('name', name);
+    // The explicit `multipart/form-data` overrides the axios instance's
+    // default `application/json` — axios detects a FormData body and
+    // rewrites it to `multipart/form-data; boundary=...`.
     await apiClient.post('/videos/upload', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
+        onUploadProgress: (e) => {
+            if (!onProgress) return;
+            const total = e.total ?? file.size;
+            if (total > 0) onProgress(Math.min(1, e.loaded / total));
+        },
     });
 };
 

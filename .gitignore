@@ -73,6 +73,9 @@ htmlcov/
 *.tar
 *.gz
 
+# Claude
+.claude/
+
 # Project-specific
 *Cargo.lock
 *target/

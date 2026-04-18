@@ -2,15 +2,21 @@
 //! reconnect-on-failure; a post-processor task drains enqueued bbox JSON to
 //! the backend. Both run on the shared tokio runtime; Drop aborts them.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use parking_lot::{Mutex, RwLock};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+
+// Monotonic "ms since process start" for rate-limiting repeated warnings.
+static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+fn monotonic_ms() -> u64 {
+    let start = *PROCESS_START.get_or_init(Instant::now);
+    start.elapsed().as_millis() as u64
+}
 
 use crate::config::{POST_QUEUE_CAPACITY, RECONNECT_INTERVAL_MS};
 use crate::decoder::StreamDecoder;
@@ -77,7 +83,15 @@ struct StreamState {
 }
 
 impl StreamState {
+    /// Idempotent status update. Consumers subscribed to the status callback
+    /// receive exactly one notification per real transition — the reconnect
+    /// loop below calls this every retry but Initializing→Initializing is a
+    /// no-op after the first one.
     fn set_status(&self, status: SourceStatus) {
+        let prev = self.status.get();
+        if prev == status {
+            return;
+        }
         self.status.set(status);
         if let Ok(state) = get_state() {
             state.trigger_status(self.source_id, status);
@@ -89,8 +103,13 @@ impl StreamState {
 
         while !self.stop_signal.load(Ordering::SeqCst) {
             match self.run_one_session().await {
-                Ok(()) => info!(source_id = self.source_id, "session ended"),
-                Err(e) => warn!(source_id = self.source_id, error = ?e, "session failed"),
+                Ok(()) => tracing::info!(source_id = self.source_id, "session ended"),
+                // All session-open failures look the same from the caller's
+                // perspective: the source isn't reachable right now. Don't
+                // leak HTTP status codes or backend error bodies — just note
+                // we're retrying. The monitor loop below keeps trying until
+                // shutdown.
+                Err(_) => tracing::warn!(source_id = self.source_id, "source offline; reconnecting"),
             }
             if self.stop_signal.load(Ordering::SeqCst) {
                 break;
@@ -112,13 +131,14 @@ impl StreamState {
                 .context("header fetch")?
         };
 
-        let stream_name = match self.player_api.get_video_info(self.source_id).await {
-            Ok(info) => info.name,
-            Err(e) => {
-                warn!(source_id = self.source_id, error = ?e, "video info fetch failed");
-                String::new()
-            }
-        };
+        // If video info isn't available (backend rolling restart, network
+        // blip) we proceed with an empty name rather than fail the whole
+        // session — the stream URLs will surface the real outage below.
+        let stream_name = self.player_api
+            .get_video_info(self.source_id)
+            .await
+            .map(|info| info.name)
+            .unwrap_or_default();
 
         let body = {
             let api = Arc::clone(&self.player_api);
@@ -147,10 +167,7 @@ impl StreamState {
             if let Ok(state) = get_state() {
                 state.trigger_metadata(this.source_id, meta, &stream_name);
             }
-            this.status.set(SourceStatus::Streaming);
-            if let Ok(state) = get_state() {
-                state.trigger_status(this.source_id, SourceStatus::Streaming);
-            }
+            this.set_status(SourceStatus::Streaming);
 
             loop {
                 if this.stop_signal.load(Ordering::SeqCst) {
@@ -176,13 +193,20 @@ impl StreamState {
     async fn post_processor_task(self: Arc<Self>, receiver: FixedSizeQueueReceiver<String>) {
         while !self.stop_signal.load(Ordering::SeqCst) {
             let Some(json) = receiver.recv().await else { break };
+            // If the session isn't currently Streaming (backend down, we're
+            // mid-reconnect), drop the queued json silently. The queue drains
+            // naturally instead of filling up and the user doesn't get a
+            // spray of POST-failure warnings during a transient outage.
+            if self.status.get() != SourceStatus::Streaming {
+                continue;
+            }
             match self.player_api.post_results(&self.urls.post_url, json).await {
                 Ok(body) => {
                     if let Ok(state) = get_state() {
                         state.trigger_post_results(self.source_id, &body);
                     }
                 }
-                Err(e) => warn!(source_id = self.source_id, error = ?e, "post results failed"),
+                Err(_) => tracing::warn!(source_id = self.source_id, "error posting results"),
             }
         }
     }
@@ -205,10 +229,23 @@ impl Source {
         runtime: &Handle,
     ) -> Result<Arc<Self>> {
         let urls = player_api.get_stream_urls(source_id);
+        // Rate-limited drop warning: on backend outage the queue can overflow
+        // at the caller's POST-rate (hundreds/sec). We emit at most one line
+        // per second so the log stays informative without drowning it.
+        let last_drop_log = Arc::new(AtomicU64::new(0));
+        let last_drop_log_cb = Arc::clone(&last_drop_log);
         let queue: FixedSizeQueue<String> = FixedSizeQueue::new(
             POST_QUEUE_CAPACITY,
-            Some(|dropped: String| {
-                warn!(len = dropped.len(), "post queue full; oldest dropped");
+            Some(move |_dropped: String| {
+                let now = monotonic_ms();
+                let prev = last_drop_log_cb.load(Ordering::Relaxed);
+                if now.saturating_sub(prev) >= 1000
+                    && last_drop_log_cb
+                        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    tracing::warn!("could not post results, dropping old requests");
+                }
             }),
         );
         let post_sender = queue.sender.clone();
@@ -236,9 +273,10 @@ impl Source {
     }
 
     pub fn push_post_result(&self, json: String) -> Result<()> {
-        self.post_sender
-            .send_sync(json)
-            .context("post queue send")
+        // send_sync now blocks on a std::sync::Mutex — under normal conditions
+        // it always succeeds. The only error path is mutex poisoning, which
+        // indicates a panic in another thread and we propagate it as-is.
+        self.post_sender.send_sync(json)
     }
 
     pub fn shutdown(&self) {
@@ -246,10 +284,9 @@ impl Source {
         for h in self.tasks.lock().drain(..) {
             h.abort();
         }
-        self.inner.status.set(SourceStatus::Stopped);
-        if let Ok(state) = get_state() {
-            state.trigger_status(self.inner.source_id, SourceStatus::Stopped);
-        }
+        // Route through set_status so we emit the Stopped callback exactly
+        // once — Drop + explicit shutdown would otherwise fire it twice.
+        self.inner.set_status(SourceStatus::Stopped);
     }
 }
 

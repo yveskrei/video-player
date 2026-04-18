@@ -13,10 +13,8 @@ class Storage:
         #   "pid": int,
         #   "start_time_ms": int,
         #   "dash_manifest_url": str,
-        #   "ffmpeg_error": bool,
         #   "prog_init_ready": threading.Event,
-        #   "consumer_queue": queue.Queue | None,
-        #   "prog_consumer_active": bool,
+        #   "hub": ProgressiveHub,  # fan-out for multi-client prog.m4s
         # }
         self.active_streams: Dict[int, dict] = {}
         self.bboxes: Dict[int, Dict[int, List[dict]]] = {}

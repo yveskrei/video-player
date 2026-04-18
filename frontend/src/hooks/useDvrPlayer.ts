@@ -1,95 +1,140 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type * as dashjs from 'dashjs';
 
-// Threshold for considering the playhead "at live edge".
-// dash.js is configured with liveDelay=6s (see VideoPlayer.tsx), so at the live edge
-// the gap between `duration` (live edge) and `time` (current position) is ~6s.
-// Anything within liveDelay + a small margin counts as live.
-const LIVE_DELAY_SEC = 6.0;
-const LIVE_THRESHOLD_SEC = LIVE_DELAY_SEC + 2.0;
-const POLL_INTERVAL_MS = 200;
-// Hard cap on the DVR window regardless of what dash.js reports.
-// Matches the backend's DASH_WINDOW_SIZE (150 segments × 2s = 300s) in stream_manager.py.
-const DVR_WINDOW_CAP_SEC = 300;
+// "At live edge" threshold. dash.js configures liveDelay=6s plus ~2s of
+// encoding headroom; 12s keeps the LIVE badge from flickering on jitter.
+const LIVE_THRESHOLD_SEC = 12;
+const POLL_MS = 200;
 
 export interface DvrState {
-    playhead: number;
-    duration: number;
-    dvrWindowSize: number;
-    dvrStart: number;
+    playhead: number;        // video.currentTime, absolute, seconds
+    duration: number;        // live edge, seconds, same scale as playhead
+    dvrStart: number;        // earliest seekable position, seconds
+    dvrWindowSize: number;   // duration - dvrStart
     isLive: boolean;
     isPaused: boolean;
     isReady: boolean;
 }
 
-const defaultState: DvrState = {
+const INITIAL: DvrState = {
     playhead: 0,
     duration: 0,
-    dvrWindowSize: 0,
     dvrStart: 0,
+    dvrWindowSize: 0,
     isLive: true,
     isPaused: false,
     isReady: false,
 };
 
-export const useDvrPlayer = (videoRef: React.RefObject<HTMLVideoElement | null>) => {
-    const [state, setState] = useState<DvrState>(defaultState);
+const readWin = (player: dashjs.MediaPlayerClass): { start: number; end: number } | null => {
+    try {
+        const w = player.getDvrWindow?.();
+        if (w && Number.isFinite(w.end) && w.end > 0) {
+            return { start: Math.max(0, w.start ?? 0), end: w.end };
+        }
+    } catch { /* ignore */ }
+    return null;
+};
+
+export const useDvrPlayer = (
+    videoRef: React.RefObject<HTMLVideoElement | null>,
+    dvrWindowSec: number,
+    streamStartMs: number | null,
+) => {
+    const [state, setState] = useState<DvrState>(INITIAL);
     const playerRef = useRef<dashjs.MediaPlayerClass | null>(null);
-    const manifestPollPausedRef = useRef<boolean>(false);
+
+    const windowSecRef = useRef(dvrWindowSec);
+    const streamStartMsRef = useRef(streamStartMs);
+    useEffect(() => { windowSecRef.current = dvrWindowSec; }, [dvrWindowSec]);
+    useEffect(() => { streamStartMsRef.current = streamStartMs; }, [streamStartMs]);
+
+    // Monotonic wall-clock anchor on the MPD's live edge. `win.end` is the
+    // authoritative live-edge reading *on the same scale as video.currentTime*
+    // (presentation time), so it's what we have to use as `duration` — using
+    // wall-clock via streamStartMs drifts because the backend's clock and the
+    // MPD's availabilityStartTime are offset by ffmpeg startup + small framerate
+    // mismatches, which over tens of seconds add up to minutes of apparent
+    // "falling behind live" with no actual playhead movement.
+    //
+    // The wall-clock anchor here only smooths over MPD refresh cadence: between
+    // MPD updates dash.js may not advance win.end, so we interpolate forward at
+    // 1×. When a fresh win.end arrives past the interpolation, we snap up.
+    const anchorRef = useRef<{ end: number; t: number } | null>(null);
 
     const setPlayer = useCallback((p: dashjs.MediaPlayerClass | null) => {
         playerRef.current = p;
+        anchorRef.current = null;
     }, []);
 
     useEffect(() => {
-        const interval = setInterval(() => {
+        const id = setInterval(() => {
             const video = videoRef.current;
             const player = playerRef.current;
             if (!video || !player) return;
 
-            try {
-                // Use the manifest's DVR window (not HTMLMediaElement.seekable) — the
-                // latter only reflects what dash.js has buffered, which at the live
-                // edge is ~6s, making seek-back-into-DVR impossible.
-                const win = player.getDvrWindow?.();
-                let duration = win?.end ?? player.duration() ?? 0;
-                let dvrStart = win?.start ?? 0;
-                if (!Number.isFinite(duration) || duration <= 0) {
-                    duration = video.duration && Number.isFinite(video.duration) ? video.duration : 0;
+            const windowSec = windowSecRef.current > 0 ? windowSecRef.current : 300;
+            const win = readWin(player);
+            const now = performance.now();
+
+            let duration = 0;
+            let rawDvrStart = 0;
+
+            if (win && win.end > 0) {
+                const prev = anchorRef.current;
+                // Backward jump of more than 2s = stream reset / manifest
+                // rollover. Re-anchor rather than interpolating across it.
+                const regressed = prev !== null && win.end < prev.end - 2;
+                if (prev === null || win.end > prev.end || regressed) {
+                    anchorRef.current = { end: win.end, t: now };
                 }
-                const dvrWindowSize = Math.min(DVR_WINDOW_CAP_SEC, Math.max(0, duration - dvrStart));
-                dvrStart = Math.max(dvrStart, duration - dvrWindowSize);
-
-                const playhead = player.time() ?? video.currentTime;
-                const behindLive = duration - playhead;
-                const isLive = behindLive <= LIVE_THRESHOLD_SEC + 0.01;
-                const isPaused = video.paused;
-
-                setState({
-                    playhead,
-                    duration,
-                    dvrWindowSize,
-                    dvrStart,
-                    isLive,
-                    isPaused,
-                    isReady: duration > 0,
-                });
-            } catch {
-                // dash.js can throw while reloading / tearing down — ignore until next tick
+                const anchor = anchorRef.current!;
+                const elapsed = (now - anchor.t) / 1000;
+                duration = Math.max(win.end, anchor.end + elapsed);
+                rawDvrStart = win.start;
+            } else if (video.seekable.length > 0) {
+                duration = video.seekable.end(video.seekable.length - 1);
+                rawDvrStart = video.seekable.start(0);
+                anchorRef.current = null;
+            } else if (streamStartMsRef.current && streamStartMsRef.current > 0) {
+                // Pre-first-MPD fallback. Scale *will* be wrong here but it's
+                // only used for the brief moment before dash.js parses the
+                // manifest; the `win`-based branch takes over immediately.
+                duration = (Date.now() - streamStartMsRef.current) / 1000;
+                anchorRef.current = null;
             }
-        }, POLL_INTERVAL_MS);
 
-        return () => clearInterval(interval);
+            // Cap dvrStart at (duration - windowSec) so a stale win.start can't
+            // over-advertise retention. For young streams win.start=0 and the
+            // cap is a no-op until the window fills up.
+            const dvrStart = Math.max(rawDvrStart, duration - windowSec);
+            const dvrWindowSize = Math.max(0, duration - dvrStart);
+
+            const playhead = video.currentTime;
+            const isPaused = video.paused;
+            const behindLive = duration - playhead;
+            // Pausing freezes the current frame — by definition behind live.
+            const isLive = !isPaused && behindLive <= LIVE_THRESHOLD_SEC;
+            const isReady = duration > 0 && video.readyState >= 1;
+
+            setState(prev => {
+                if (
+                    prev.isReady === isReady
+                    && prev.isLive === isLive
+                    && prev.isPaused === isPaused
+                    && Math.abs(prev.playhead - playhead) < 0.05
+                    && Math.abs(prev.duration - duration) < 0.05
+                    && Math.abs(prev.dvrStart - dvrStart) < 0.05
+                    && Math.abs(prev.dvrWindowSize - dvrWindowSize) < 0.05
+                ) return prev;
+                return { playhead, duration, dvrStart, dvrWindowSize, isLive, isPaused, isReady };
+            });
+        }, POLL_MS);
+        return () => clearInterval(id);
     }, [videoRef]);
 
-    const play = useCallback(() => {
-        videoRef.current?.play().catch(() => {});
-    }, [videoRef]);
-
-    const pause = useCallback(() => {
-        videoRef.current?.pause();
-    }, [videoRef]);
-
+    const play = useCallback(() => { videoRef.current?.play().catch(() => {}); }, [videoRef]);
+    const pause = useCallback(() => { videoRef.current?.pause(); }, [videoRef]);
     const togglePlay = useCallback(() => {
         const v = videoRef.current;
         if (!v) return;
@@ -97,86 +142,50 @@ export const useDvrPlayer = (videoRef: React.RefObject<HTMLVideoElement | null>)
         else v.pause();
     }, [videoRef]);
 
-    const seekTo = useCallback((timeSeconds: number) => {
+    const seekTo = useCallback((timeSec: number) => {
         const video = videoRef.current;
         const player = playerRef.current;
         if (!video || !player) return;
-
-        // Clamp bounds: prefer manifest DVR window, fall back to video.seekable.
-        let win: { start: number; end: number } | null = null;
-        try { win = player.getDvrWindow?.() ?? null; } catch { win = null; }
-
-        let high = win?.end ?? 0;
-        let low = win?.start ?? 0;
-        if (high <= 0 && video.seekable.length > 0) {
-            high = video.seekable.end(video.seekable.length - 1);
-            low = video.seekable.start(0);
-        }
-        if (high <= 0) high = player.duration() || video.duration || 0;
-        low = Math.max(low, high - DVR_WINDOW_CAP_SEC);
-        const clamped = Math.min(Math.max(timeSeconds, low), high);
-
-        const seekableStart = video.seekable.length > 0 ? video.seekable.start(0) : null;
-        const seekableEnd = video.seekable.length > 0 ? video.seekable.end(video.seekable.length - 1) : null;
-        console.debug('[DVR seek]', {
-            requested: timeSeconds.toFixed(2),
-            clamped: clamped.toFixed(2),
-            low: low.toFixed(2),
-            high: high.toFixed(2),
-            before: video.currentTime.toFixed(2),
-            dvrWindow: win ? `[${win.start.toFixed(1)}, ${win.end.toFixed(1)}]` : 'n/a',
-            videoSeekable: seekableStart !== null ? `[${seekableStart.toFixed(1)}, ${seekableEnd!.toFixed(1)}]` : 'n/a',
-        });
-
-        // Use video.currentTime directly — dash.js listens for the `seeking` event and
-        // fetches the needed segment. Calling `player.seek()` has been observed to snap
-        // back to the live edge when the stream was initialized with liveDelay set.
-        try {
-            video.currentTime = clamped;
-        } catch (e) {
-            console.warn('[DVR seek] currentTime failed, falling back to player.seek', e);
-            try { player.seek(clamped); } catch { /* ignore */ }
-        }
+        // Clamp against the MPD's seekable range. Apply the seek
+        // synchronously — the earlier refreshManifest-wrapped version
+        // introduced a visible delay between click and playhead update
+        // (manifest fetches can take hundreds of ms, during which the user
+        // sees no response). Kick off a refresh in the background so
+        // dash.js can pick up fresh segments if the seek landed in a range
+        // it hadn't fetched yet.
+        const w = readWin(player);
+        const low = w ? w.start : (video.seekable.length > 0 ? video.seekable.start(0) : 0);
+        const high = w ? w.end : (video.seekable.length > 0 ? video.seekable.end(video.seekable.length - 1) : (video.duration || 0));
+        const target = Math.min(Math.max(timeSec, low), high);
+        try { video.currentTime = target; } catch { /* ignore */ }
+        try { player.refreshManifest(() => {}); } catch { /* ignore */ }
     }, [videoRef]);
 
-    const seekBy = useCallback((deltaSeconds: number) => {
-        const player = playerRef.current;
-        if (!player) return;
-        const current = player.time() ?? 0;
-        seekTo(current + deltaSeconds);
-    }, [seekTo]);
+    const seekBy = useCallback((deltaSec: number) => {
+        const v = videoRef.current;
+        if (!v) return;
+        seekTo(v.currentTime + deltaSec);
+    }, [videoRef, seekTo]);
 
     const seekToLive = useCallback(() => {
         const player = playerRef.current;
         if (!player) return;
-        const win = player.getDvrWindow?.();
-        const target = win?.end ?? player.duration() ?? 0;
-        try { player.seek(target); } catch { /* ignore */ }
-    }, []);
-
-    const setManifestPollPaused = useCallback((paused: boolean) => {
-        const player = playerRef.current;
-        if (!player) return;
-        if (manifestPollPausedRef.current === paused) return;
-        manifestPollPausedRef.current = paused;
         try {
-            player.updateSettings({
-                streaming: {
-                    manifestUpdateRetryInterval: paused ? 60_000 : 1000,
-                },
+            player.refreshManifest(() => {
+                const p = playerRef.current;
+                const v = videoRef.current;
+                if (!p || !v) return;
+                const w = readWin(p);
+                const end = w ? w.end : (v.seekable.length > 0 ? v.seekable.end(v.seekable.length - 1) : 0);
+                if (end <= 0) return;
+                // Seek 5s behind live so the decoder has headroom.
+                try {
+                    v.currentTime = Math.max(end - 5, 0);
+                    v.play().catch(() => {});
+                } catch { /* ignore */ }
             });
         } catch { /* ignore */ }
-    }, []);
+    }, [videoRef]);
 
-    return {
-        state,
-        setPlayer,
-        play,
-        pause,
-        togglePlay,
-        seekTo,
-        seekBy,
-        seekToLive,
-        setManifestPollPaused,
-    };
+    return { state, setPlayer, play, pause, togglePlay, seekTo, seekBy, seekToLive };
 };

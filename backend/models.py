@@ -16,6 +16,9 @@ class VideoInfo(BaseModel):
     dash_manifest_url: Optional[str] = None
     prog_url: Optional[str] = None
     prog_init_url: Optional[str] = None
+    # DVR capacity in seconds — authoritative value from the backend so the
+    # frontend doesn't have to hardcode the window size.
+    dvr_window_seconds: Optional[int] = None
 
 
 class BBoxData(BaseModel):

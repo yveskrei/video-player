@@ -6,7 +6,6 @@ use std::ffi::{CStr, CString};
 use std::slice;
 
 use libc::{c_char, c_int, c_void};
-use tracing::{error, info, warn};
 
 pub mod callbacks;
 pub mod config;
@@ -33,7 +32,7 @@ pub extern "C" fn SetCallbacks(
     let state = match get_state() {
         Ok(s) => s,
         Err(e) => {
-            error!(error = ?e, "SetCallbacks: state init failed");
+            tracing::error!(error = ?e, "SetCallbacks: state init failed");
             return;
         }
     };
@@ -43,7 +42,7 @@ pub extern "C" fn SetCallbacks(
         status: source_status,
         post_results,
     });
-    info!("callbacks registered");
+    tracing::info!("callbacks registered");
 }
 
 /// # Safety
@@ -51,51 +50,61 @@ pub extern "C" fn SetCallbacks(
 #[no_mangle]
 pub unsafe extern "C" fn InitMultipleSources(source_ids: *const c_int, size: c_int) {
     if source_ids.is_null() || size <= 0 {
-        warn!(size, "InitMultipleSources: invalid args");
+        tracing::warn!(size, "InitMultipleSources: invalid args");
         return;
     }
     let state = match get_state() {
         Ok(s) => s,
         Err(e) => {
-            error!(error = ?e, "InitMultipleSources: state init failed");
+            tracing::error!(error = ?e, "InitMultipleSources: state init failed");
             return;
         }
     };
     if state.callbacks().is_none() {
-        error!("InitMultipleSources: SetCallbacks must be called first");
+        tracing::error!("InitMultipleSources: SetCallbacks must be called first");
         return;
     }
-    let ids: Vec<i32> = slice::from_raw_parts(source_ids, size as usize).to_vec();
+    let ids: Vec<i32> = unsafe {
+        slice::from_raw_parts(source_ids, size as usize).to_vec()
+    };
+
     let handle = state.runtime().handle().clone();
     for id in ids {
         if state.has_source(id) {
-            info!(source_id = id, "source already initialised; skipping");
+            tracing::info!(source_id = id, "source already initialised; skipping");
             continue;
         }
         match Source::new(id, state.player_api().clone(), &handle) {
             Ok(src) => {
                 state.insert_source(src);
-                info!(source_id = id, "source started");
+                tracing::info!(source_id = id, "source started");
             }
-            Err(e) => error!(source_id = id, error = ?e, "source spawn failed"),
+            Err(e) => tracing::error!(source_id = id, error = ?e, "source spawn failed"),
         }
     }
 }
 
 #[no_mangle]
-pub extern "C" fn StopSource(source_id: c_int) {
+pub extern "C" fn StopMultipleSources(source_ids: *const c_int, size: c_int) {
     let state = match get_state() {
         Ok(s) => s,
         Err(e) => {
-            error!(error = ?e, "StopSource: state init failed");
+            tracing::error!(error = ?e, "StopSource: state init failed");
             return;
         }
     };
-    if let Some(src) = state.remove_source(source_id) {
-        src.shutdown();
-        // src drops here: Drop is a no-op second shutdown, and the Arc's final
-        // strong count releases on scope end once tasks have unwound.
-        drop(src);
+
+    let ids: Vec<i32> = unsafe {
+        slice::from_raw_parts(source_ids, size as usize).to_vec()
+    };
+
+    for id in ids {
+        if let Some(src) = state.remove_source(id) {
+            src.shutdown();
+            // src drops here: Drop is a no-op second shutdown, and the Arc's final
+            // strong count releases on scope end once tasks have unwound.
+            drop(src);
+        }
     }
 }
 
@@ -104,31 +113,31 @@ pub extern "C" fn StopSource(source_id: c_int) {
 #[no_mangle]
 pub unsafe extern "C" fn PostResults(source_id: c_int, json: *const c_char) -> c_int {
     if json.is_null() {
-        warn!(source_id, "PostResults: null json");
+        tracing::warn!(source_id, "PostResults: null json");
         return -1;
     }
     let json_str = match CStr::from_ptr(json).to_str() {
         Ok(s) => s,
         Err(e) => {
-            warn!(source_id, error = ?e, "PostResults: invalid utf-8");
+            tracing::warn!(source_id, error = ?e, "PostResults: invalid utf-8");
             return -1;
         }
     };
     let state = match get_state() {
         Ok(s) => s,
         Err(e) => {
-            error!(error = ?e, "PostResults: state init failed");
+            tracing::error!(error = ?e, "PostResults: state init failed");
             return -1;
         }
     };
     let Some(src) = state.source_by_id(source_id) else {
-        warn!(source_id, "PostResults: unknown source_id");
+        tracing::warn!(source_id, "PostResults: unknown source_id");
         return -1;
     };
     match src.push_post_result(json_str.to_string()) {
         Ok(()) => 0,
         Err(e) => {
-            warn!(source_id, error = ?e, "PostResults: enqueue failed");
+            tracing::warn!(source_id, error = ?e, "PostResults: enqueue failed");
             -1
         }
     }

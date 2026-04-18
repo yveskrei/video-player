@@ -27,16 +27,34 @@ export const drawBBoxes = (
 
     ctx.save();
 
+    const maxIdx = originalWidth * originalHeight;
+
     bboxes.forEach(bbox => {
         if (bbox.confidence < minConfidence) return;
+
+        // Guard against malformed 1D-index pairs: negatives would produce
+        // negative mod/floor results (JS `%` preserves sign) and paint a
+        // rectangle across the whole frame; out-of-range values do the same
+        // thing at the right/bottom edge. Skip any bbox that can't be
+        // meaningfully rendered.
+        const tl = bbox.top_left_corner;
+        const br = bbox.bottom_right_corner;
+        if (
+            !Number.isFinite(tl) || !Number.isFinite(br)
+            || tl < 0 || br < 0
+            || tl >= maxIdx || br > maxIdx
+            || br <= tl
+        ) {
+            return;
+        }
 
         const color = COLORS[bbox.class_name.toLowerCase()] || COLORS.default;
 
         // Convert 1D indices to 2D coordinates
-        const y1_orig = Math.floor(bbox.top_left_corner / originalWidth);
-        const x1_orig = bbox.top_left_corner % originalWidth;
-        const y2_orig = Math.floor(bbox.bottom_right_corner / originalWidth);
-        const x2_orig = bbox.bottom_right_corner % originalWidth;
+        const y1_orig = Math.floor(tl / originalWidth);
+        const x1_orig = tl % originalWidth;
+        const y2_orig = Math.floor(br / originalWidth);
+        const x2_orig = br % originalWidth;
 
         // Scale to current display size
         const x1 = x1_orig * scaleX;
@@ -46,6 +64,8 @@ export const drawBBoxes = (
 
         const w = x2 - x1;
         const h = y2 - y1;
+
+        if (w <= 0 || h <= 0) return;
 
         // Draw Box
         ctx.strokeStyle = color;

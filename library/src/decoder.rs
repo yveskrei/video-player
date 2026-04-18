@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use ffmpeg_next::ffi as ff;
-use tracing::warn;
 
 use crate::config::PTS_TIMEBASE;
 
@@ -70,7 +69,7 @@ unsafe extern "C" fn avio_read_cb(
         }
         Ok(n) => (written + n) as c_int,
         Err(e) => {
-            warn!(error = ?e, "avio read failed");
+            tracing::warn!(error = ?e, "avio read failed");
             ff::AVERROR_EOF
         }
     }
@@ -305,7 +304,7 @@ impl StreamDecoder {
                 }
                 let send = ff::avcodec_send_packet(self.codec_ctx, self.packet);
                 if send < 0 && send != ff::AVERROR(ff::EAGAIN) {
-                    warn!(ret = send, "avcodec_send_packet non-fatal");
+                    tracing::warn!(ret = send, "avcodec_send_packet non-fatal");
                 }
                 if let Some(frame) = self.drain_one_frame()? {
                     return Ok(Some(frame));

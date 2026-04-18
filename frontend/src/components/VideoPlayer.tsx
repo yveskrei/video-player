@@ -25,7 +25,13 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(({ man
         if (playerRef.current) return;
 
         const MAX_RETRIES = 3;
-        const READY_TIMEOUT_MS = 4000;
+        // The watchdog exists for a specific dash.js 5.1.1 race where
+        // STREAMS_COMPOSED never fires (see comment below). It's *not* for
+        // slow networks. 4s was aggressive enough to trigger on healthy-but-
+        // slow inits; 10s is long enough that only the real bug fires it,
+        // and the readyState≥1 check below means any sign of life counts as
+        // progress.
+        const READY_TIMEOUT_MS = 10000;
 
         let retriesLeft = MAX_RETRIES;
         let watchdog: ReturnType<typeof setTimeout> | null = null;
@@ -67,21 +73,57 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(({ man
                             value: new Date().toISOString(),
                         },
                     },
-                    delay: { liveDelay: 6.0 },
+                    // The backend emits `-ldash 1`, which advertises low-latency DASH
+                    // via ServiceDescription and SuggestedPresentationDelay. dash.js
+                    // auto-enables its LL catchup path on those manifests and drags
+                    // the playhead toward live whenever it decides we're "too far
+                    // behind" — which breaks DVR seeks (user seeks to -1:00, drifts
+                    // back to live over a few seconds). Opt out of both directives.
+                    applyServiceDescription: false,
+                    applyProducerReferenceTime: false,
+                    delay: { liveDelay: 6.0, useSuggestedPresentationDelay: false },
                     liveCatchup: {
                         mode: 'liveCatchupModeDefault',
                         enabled: false,
                         maxDrift: 0,
                         playbackRate: { min: 0, max: 0 }
                     },
+                    // dash.js's GapController auto-seeks FORWARD when it
+                    // decides the playhead is in an unbuffered gap. For a
+                    // live DVR stream, sitting at the oldest edge (-5:00)
+                    // while the MPD slides makes the playhead fall *behind*
+                    // the new window start; GapController then jumps the
+                    // playhead forward into a region where ffmpeg may have
+                    // just deleted the segments (symptom: spontaneous jump
+                    // to -3:30 and a hard freeze). liveCatchup.enabled:false
+                    // does NOT stop this — `gaps.*` is the setting that
+                    // governs discontinuity-based seeks, not rate catchup.
+                    gaps: {
+                        jumpGaps: false,
+                        jumpLargeGaps: false,
+                        enableSeekFix: false,
+                        enableStallFix: false,
+                    },
                     manifestUpdateRetryInterval: 1000,
                     retryIntervals: { MPD: 1000 },
                     retryAttempts: { MPD: 2 },
                     abr: { limitBitrateByPortal: true },
+                    // Aggressive MSE pruning. The old 20s bufferToKeep with
+                    // no explicit bufferPruningInterval let dash.js accumulate
+                    // stale segments behind the playhead for minutes, and
+                    // on a long DVR session MSE eventually hit its quota —
+                    // manifesting as "playable segments become unplayable"
+                    // growing from the oldest side toward live, ending with
+                    // even live frozen. A tight prune interval (~4s) and a
+                    // smaller `bufferToKeep` evicts old buffer as soon as
+                    // it's behind the playhead enough to be useless. Also
+                    // trimmed forward buffer a bit — 15s is plenty at our
+                    // 2s segment size.
                     buffer: {
-                        bufferTimeAtTopQuality: 30,
-                        bufferTimeAtTopQualityLongForm: 60,
-                        bufferToKeep: 20,
+                        bufferTimeAtTopQuality: 15,
+                        bufferTimeAtTopQualityLongForm: 30,
+                        bufferToKeep: 10,
+                        bufferPruningInterval: 4,
                         fastSwitchEnabled: true,
                     }
                 }
@@ -102,6 +144,15 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(({ man
                 }
             });
 
+            // No PLAYBACK_STALLED / BUFFER_EMPTY handler: those events
+            // fire every time dash.js hits a brief unbuffered moment,
+            // which includes the normal seek → fetch → decode round-trip.
+            // Seeking the playhead to live on those events turned every
+            // DVR click into "bounced back to live" and hid the
+            // user-chosen position. With GapController disabled (see
+            // `gaps.*: false` above) genuine stalls are rare, and the
+            // honest recovery is a page refresh.
+
             // Watchdog: dash.js 5.1.1 has a race in StreamController._composePeriods where
             // the initial `_initializeForFirstStream` call throws because the stream's
             // adapter isn't loaded yet (`Promise.all` resolves before `stream.initialize()`
@@ -112,7 +163,12 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(({ man
             watchdog = setTimeout(() => {
                 if (disposed) return;
                 const video = videoRef.current;
-                if (!video || video.readyState >= 3) return;
+                // readyState ≥ 1 = HAVE_METADATA: dash.js successfully parsed
+                // the manifest and handed it to the media element. If we got
+                // that far, the STREAMS_COMPOSED race didn't bite us — just
+                // let the buffer fill naturally instead of throwing away
+                // progress with a player.reset().
+                if (!video || video.readyState >= 1) return;
                 if (retriesLeft <= 0) return;
                 retriesLeft--;
                 try { player.reset(); } catch { /* ignore */ }
@@ -128,6 +184,16 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(({ man
         video.addEventListener('resize', handleResize);
         video.addEventListener('canplay', handleCanPlay);
 
+        // Safety net: if anything (dash.js LL catchup, browser quirk, user
+        // extension) nudges playbackRate away from 1.0 we force it back. The
+        // listener is idempotent — setting the same value triggers one more
+        // ratechange that passes the guard, so there's no loop.
+        const handleRateChange = () => {
+            const v = videoRef.current;
+            if (v && v.playbackRate !== 1) v.playbackRate = 1;
+        };
+        video.addEventListener('ratechange', handleRateChange);
+
         return () => {
             disposed = true;
             clearWatchdog();
@@ -135,6 +201,7 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(({ man
                 videoRef.current.removeEventListener('loadedmetadata', handleResize);
                 videoRef.current.removeEventListener('resize', handleResize);
                 videoRef.current.removeEventListener('canplay', handleCanPlay);
+                videoRef.current.removeEventListener('ratechange', handleRateChange);
             }
             if (playerRef.current) {
                 try { playerRef.current.reset(); } catch (e) { console.warn('Error resetting player:', e); }

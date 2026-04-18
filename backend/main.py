@@ -98,18 +98,15 @@ async def serve_progressive_init(video_id: int):
 @app.get("/progressive/{video_id}/prog.m4s")
 async def serve_progressive_stream(video_id: int, request: Request):
     """
-    Stream progressive fMP4 media fragments from FFmpeg stdout.
-    Single consumer only — returns 409 if already in use.
-    Blocks until prog_init_ready, then streams live bytes to the client.
+    Stream progressive fMP4 media fragments from FFmpeg stdout to a client.
+    Multiple simultaneous clients are supported via the stream's ProgressiveHub —
+    each request gets its own queue and receives whole moof+mdat fragments.
+    Blocks until prog_init_ready, then streams live fragments.
     """
     stream = storage.active_streams.get(video_id)
     if not stream:
         raise HTTPException(404, f"No active stream for video {video_id}")
 
-    if stream.get("prog_consumer_active"):
-        raise HTTPException(409, "Progressive stream already has an active consumer")
-
-    # Wait for monitor thread to finish extracting the init segment
     init_ready: threading.Event = stream.get("prog_init_ready")
     if init_ready is None:
         raise HTTPException(503, "Progressive stream not initialised")
@@ -119,39 +116,35 @@ async def serve_progressive_stream(video_id: int, request: Request):
     if not ready:
         raise HTTPException(503, "Timed out waiting for progressive stream init")
 
-    # Re-fetch stream in case it died while we were waiting
     stream = storage.active_streams.get(video_id)
     if not stream:
         raise HTTPException(404, "Stream ended before progressive consumer could connect")
 
-    consumer_queue: qmod.Queue = qmod.Queue(maxsize=200)
-    stream["consumer_queue"] = consumer_queue
-    stream["prog_consumer_active"] = True
+    hub = stream.get("hub")
+    if hub is None:
+        raise HTTPException(503, "Progressive stream hub missing")
+
+    consumer_queue = hub.subscribe()
 
     async def generate():
         try:
             while True:
-                s = storage.active_streams.get(video_id)
-                if s is None:
-                    break
                 try:
                     chunk = await loop.run_in_executor(
                         None, lambda: consumer_queue.get(timeout=2.0)
                     )
                 except qmod.Empty:
-                    # Still alive, keep waiting
+                    if storage.active_streams.get(video_id) is None:
+                        break
                     continue
                 if chunk is None:
-                    # Sentinel — stream is shutting down
+                    # Sentinel from hub.close() — stream is shutting down
                     break
                 yield chunk
         except Exception:
             pass
         finally:
-            s = storage.active_streams.get(video_id)
-            if s and s.get("consumer_queue") is consumer_queue:
-                s["consumer_queue"] = None
-                s["prog_consumer_active"] = False
+            hub.unsubscribe(consumer_queue)
 
     return StreamingResponse(
         generate(),

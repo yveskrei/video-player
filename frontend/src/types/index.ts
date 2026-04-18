@@ -13,6 +13,7 @@ export interface VideoInfo {
     dash_manifest_url: string | null;
     prog_url: string | null;
     prog_init_url: string | null;
+    dvr_window_seconds?: number | null;
 }
 
 export interface BBox {

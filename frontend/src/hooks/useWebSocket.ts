@@ -13,6 +13,10 @@ export const useWebSocket = (options: UseWebSocketOptions = {}) => {
     const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const mountedRef = useRef(true);
     const onVideoUpdateRef = useRef(options.onVideoUpdate);
+    // Desired subscriptions — kept independent of socket readiness so a
+    // subscribe() call made before the WS is open (or during a reconnect)
+    // isn't silently lost. Re-sent on every (re)open.
+    const subscribedIdsRef = useRef<Set<number>>(new Set());
 
     useEffect(() => {
         onVideoUpdateRef.current = options.onVideoUpdate;
@@ -33,6 +37,11 @@ export const useWebSocket = (options: UseWebSocketOptions = {}) => {
             if (reconnectTimeoutRef.current) {
                 clearTimeout(reconnectTimeoutRef.current);
                 reconnectTimeoutRef.current = null;
+            }
+            // Replay any subscriptions requested while the socket was
+            // still connecting or after a reconnect.
+            for (const id of subscribedIdsRef.current) {
+                ws.send(JSON.stringify({ type: 'subscribe_video', video_id: id }));
             }
         };
 
@@ -68,12 +77,14 @@ export const useWebSocket = (options: UseWebSocketOptions = {}) => {
     }, []);
 
     const subscribe = useCallback((videoId: number) => {
+        subscribedIdsRef.current.add(videoId);
         if (wsRef.current?.readyState === WebSocket.OPEN) {
             wsRef.current.send(JSON.stringify({ type: 'subscribe_video', video_id: videoId }));
         }
     }, []);
 
     const unsubscribe = useCallback((videoId: number) => {
+        subscribedIdsRef.current.delete(videoId);
         if (wsRef.current?.readyState === WebSocket.OPEN) {
             wsRef.current.send(JSON.stringify({ type: 'unsubscribe_video', video_id: videoId }));
         }

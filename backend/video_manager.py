@@ -4,6 +4,7 @@ from pathlib import Path
 from storage import storage
 from models import VideoInfo
 from enums import StreamStatus, VideoUpdateReason
+from stream_manager import DASH_SEGMENT_DURATION, DASH_WINDOW_SIZE
 from websocket_manager import manager as ws_manager, broadcast_sync
 import asyncio
 import shutil
@@ -84,6 +85,7 @@ class VideoManager:
             dash_manifest_url=stream.get("dash_manifest_url") if stream else None,
             prog_url=f"/progressive/{video_id}/prog.m4s" if stream else None,
             prog_init_url=f"/progressive/{video_id}/progressive.mp4" if stream else None,
+            dvr_window_seconds=DASH_SEGMENT_DURATION * DASH_WINDOW_SIZE,
         )
 
     @staticmethod

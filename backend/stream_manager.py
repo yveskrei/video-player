@@ -20,7 +20,63 @@ DASH_OUTPUT_DIR = Path("./dash_streams")
 PROGRESSIVE_OUTPUT_DIR = Path("./progressive_streams")
 DASH_SEGMENT_DURATION = 2   # seconds
 DASH_WINDOW_SIZE = 150      # 150 × 2s = 300s DVR window
-INIT_TIMEOUT = 10           # seconds to wait for DASH manifest
+INIT_TIMEOUT = 20           # seconds to wait for DASH manifest (FFmpeg can
+                            # spend several seconds probing before it emits
+                            # its first segment, especially on -stream_loop
+                            # -1 with -c:v copy)
+
+
+class ProgressiveHub:
+    """
+    One-producer-many-consumers fan-out for live fMP4 fragments.
+
+    The stdout drainer is the sole producer; each HTTP client owns its own
+    queue. publish() clones the fragment into every subscriber's queue with
+    put_nowait — a slow consumer drops its own fragments without affecting
+    FFmpeg or other clients. latest_fragment is cached so a joining client
+    gets video immediately instead of waiting up to one frag_duration.
+    """
+
+    def __init__(self) -> None:
+        self._subs: set[qmod.Queue] = set()
+        self._latest: bytes | None = None
+        self._lock = threading.Lock()
+
+    def subscribe(self) -> qmod.Queue:
+        q: qmod.Queue = qmod.Queue(maxsize=200)
+        with self._lock:
+            self._subs.add(q)
+            latest = self._latest
+        if latest is not None:
+            try:
+                q.put_nowait(latest)
+            except qmod.Full:
+                pass
+        return q
+
+    def unsubscribe(self, q: qmod.Queue) -> None:
+        with self._lock:
+            self._subs.discard(q)
+
+    def publish(self, fragment: bytes) -> None:
+        with self._lock:
+            self._latest = fragment
+            subs = list(self._subs)
+        for q in subs:
+            try:
+                q.put_nowait(fragment)
+            except qmod.Full:
+                pass
+
+    def close(self) -> None:
+        with self._lock:
+            subs = list(self._subs)
+            self._subs.clear()
+        for q in subs:
+            try:
+                q.put_nowait(None)
+            except qmod.Full:
+                pass
 
 
 class StreamManager:
@@ -69,11 +125,57 @@ class StreamManager:
             "dash_manifest_url": stream.get("dash_manifest_url") if stream else None,
             "prog_url": f"/progressive/{video_id}/prog.m4s" if stream else None,
             "prog_init_url": f"/progressive/{video_id}/progressive.mp4" if stream else None,
+            # Authoritative DVR capacity in seconds. Frontend uses this
+            # directly as the window size instead of trying to derive one
+            # from dash.js's getDvrWindow() (which can jitter) or a hidden
+            # constant (which drifts out of sync when the backend is tuned).
+            "dvr_window_seconds": DASH_SEGMENT_DURATION * DASH_WINDOW_SIZE,
         }
 
     # ------------------------------------------------------------------
     # MP4 init segment extraction (ftyp + moov from FFmpeg stdout)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _read_mp4_box(stdout) -> tuple[str, bytes]:
+        """
+        Read one complete MP4 box from stdout. Returns (box_type, box_bytes)
+        where box_bytes is the header + payload concatenated (so callers can
+        forward the raw on-wire bytes). Raises RuntimeError on unexpected EOF.
+        """
+        header = b""
+        while len(header) < 8:
+            chunk = stdout.read(8 - len(header))
+            if not chunk:
+                raise RuntimeError("FFmpeg stdout closed at MP4 box boundary")
+            header += chunk
+
+        box_size = struct.unpack(">I", header[:4])[0]
+        box_type = header[4:8].decode("ascii", errors="ignore")
+
+        if box_size == 1:
+            ext = b""
+            while len(ext) < 8:
+                chunk = stdout.read(8 - len(ext))
+                if not chunk:
+                    raise RuntimeError("FFmpeg stdout closed reading extended box size")
+                ext += chunk
+            box_size = struct.unpack(">Q", ext)[0]
+            header += ext
+            remaining = box_size - 16
+        elif box_size == 0:
+            raise RuntimeError(f"Unsupported MP4 box with size=0 (extends to EOF): {box_type}")
+        else:
+            remaining = box_size - 8
+
+        content = b""
+        while len(content) < remaining:
+            chunk = stdout.read(min(65536, remaining - len(content)))
+            if not chunk:
+                raise RuntimeError(f"FFmpeg stdout closed while reading {box_type} box content")
+            content += chunk
+
+        return box_type, header + content
 
     @staticmethod
     def _read_mp4_init(stdout) -> bytes:
@@ -83,53 +185,15 @@ class StreamManager:
         Raises RuntimeError if the pipe closes before moov is complete.
         """
         init_bytes = b""
-
         while True:
-            # Read 8-byte box header (size + type)
-            header = b""
-            while len(header) < 8:
-                chunk = stdout.read(8 - len(header))
-                if not chunk:
-                    raise RuntimeError("FFmpeg stdout closed before init segment was complete")
-                header += chunk
-
-            box_size = struct.unpack(">I", header[:4])[0]
-            box_type = header[4:8].decode("ascii", errors="ignore")
-
-            if box_size == 1:
-                # Extended 64-bit size follows the type field
-                ext = b""
-                while len(ext) < 8:
-                    chunk = stdout.read(8 - len(ext))
-                    if not chunk:
-                        raise RuntimeError("FFmpeg stdout closed reading extended box size")
-                    ext += chunk
-                box_size = struct.unpack(">Q", ext)[0]
-                header += ext
-                remaining = box_size - 16
-            elif box_size == 0:
-                raise RuntimeError(f"Unsupported MP4 box with size=0 (extends to EOF): {box_type}")
-            else:
-                remaining = box_size - 8
-
-            # Read box content
-            content = b""
-            while len(content) < remaining:
-                chunk = stdout.read(min(65536, remaining - len(content)))
-                if not chunk:
-                    raise RuntimeError(f"FFmpeg stdout closed while reading {box_type} box content")
-                content += chunk
-
-            init_bytes += header + content
-            logger.debug(f"[Init] Read box: {box_type} ({box_size} bytes)")
-
+            box_type, box_bytes = StreamManager._read_mp4_box(stdout)
+            init_bytes += box_bytes
+            logger.debug(f"[Init] Read box: {box_type} ({len(box_bytes)} bytes)")
             if box_type == "moov":
                 logger.info(f"[Init] Complete — {len(init_bytes)} bytes")
                 break
-
             if len(init_bytes) > 10 * 1024 * 1024:
                 raise RuntimeError("Init segment exceeds 10 MB safety limit — possible format issue")
-
         return init_bytes
 
     # ------------------------------------------------------------------
@@ -148,44 +212,56 @@ class StreamManager:
             logger.debug(f"[Stream {video_id}] Stderr reader ended: {e}")
 
     @staticmethod
-    def _stdout_reader(video_id: int, process) -> None:
+    def _fragment_publisher(video_id: int, process) -> None:
         """
-        Drain FFmpeg stdout after init is extracted.
-        Prevents FFmpeg from blocking when no HTTP consumer is connected.
-        When a consumer is active, pushes chunks to its queue.
+        Drain FFmpeg stdout as whole fMP4 fragments (moof+mdat pairs) and
+        publish each complete fragment to the stream's ProgressiveHub.
+
+        Publishing fragment-granular (rather than byte-granular) lets a
+        late-joining client start cleanly: every fragment begins with a
+        moof + keyframe, so it's a valid decode restart point. Reading
+        this thread is also the sole drainer of the pipe, which is what
+        prevents FFmpeg from blocking regardless of subscriber count.
         """
         while process.poll() is None:
-            try:
-                chunk = process.stdout.read1(65536)
-            except Exception:
-                break
-            if not chunk:
-                time.sleep(0.005)
-                continue
             stream = storage.active_streams.get(video_id)
             if not stream:
                 break
-            q = stream.get("consumer_queue")
-            if q is not None:
-                try:
-                    q.put_nowait(chunk)
-                except qmod.Full:
-                    pass  # slow consumer — drop chunk rather than block FFmpeg
+            hub: "ProgressiveHub | None" = stream.get("hub")
+            if hub is None:
+                break
+            try:
+                first_type, first_bytes = StreamManager._read_mp4_box(process.stdout)
+            except RuntimeError as e:
+                logger.debug(f"[Stream {video_id}] Publisher EOF: {e}")
+                break
+            if first_type != "moof":
+                # fMP4 is a strict moof+mdat sequence after the init. Anything
+                # else would mean FFmpeg emitted an unexpected format; skip it
+                # rather than poison the fan-out with a partial fragment.
+                logger.warning(f"[Stream {video_id}] Expected moof, got {first_type}; skipping")
+                continue
+            try:
+                second_type, second_bytes = StreamManager._read_mp4_box(process.stdout)
+            except RuntimeError as e:
+                logger.debug(f"[Stream {video_id}] Publisher EOF after moof: {e}")
+                break
+            if second_type != "mdat":
+                logger.warning(f"[Stream {video_id}] Expected mdat after moof, got {second_type}; skipping")
+                continue
+            hub.publish(first_bytes + second_bytes)
 
     @staticmethod
-    def _do_terminate(video_id: int, process, stderr_thread, stdout_reader) -> None:
-        """Kill FFmpeg, signal the consumer queue, join threads, clean dirs."""
+    def _do_terminate(video_id: int, process, stderr_thread, fragment_publisher) -> None:
+        """Kill FFmpeg, close the hub so every subscriber exits, join threads, clean dirs."""
         logger.info(f"[Stream {video_id}] Terminating FFmpeg...")
 
-        # Signal consumer so its HTTP generator exits cleanly
+        # Close the hub so every subscriber's HTTP generator exits cleanly
         stream = storage.active_streams.get(video_id)
         if stream:
-            q = stream.get("consumer_queue")
-            if q is not None:
-                try:
-                    q.put_nowait(None)  # sentinel: tells consumer to stop
-                except qmod.Full:
-                    pass
+            hub = stream.get("hub")
+            if hub is not None:
+                hub.close()
 
         # Kill FFmpeg process group
         try:
@@ -202,8 +278,8 @@ class StreamManager:
             logger.debug(f"[Stream {video_id}] Process cleanup: {e}")
 
         stderr_thread.join(timeout=2)
-        if stdout_reader is not None:
-            stdout_reader.join(timeout=2)
+        if fragment_publisher is not None:
+            fragment_publisher.join(timeout=2)
 
         # Remove output directories
         for d in [
@@ -242,7 +318,7 @@ class StreamManager:
         )
         stderr_thread.start()
 
-        stdout_reader = None
+        fragment_publisher = None
 
         # --- Phase 0: extract progressive init segment from stdout ---
         try:
@@ -258,13 +334,13 @@ class StreamManager:
             if stream:
                 stream["status"] = StreamStatus.TERMINATING
 
-        # --- Start stdout drainer (takes over stdout after init) ---
-        stdout_reader = threading.Thread(
-            target=StreamManager._stdout_reader,
+        # --- Start fragment publisher (takes over stdout after init) ---
+        fragment_publisher = threading.Thread(
+            target=StreamManager._fragment_publisher,
             args=(video_id, process),
             daemon=True,
         )
-        stdout_reader.start()
+        fragment_publisher.start()
 
         # --- Phase 1: INITIALIZING — poll for DASH manifest + enough segments ---
         # Don't transition to STREAMING until at least MIN_READY_SEGMENTS media
@@ -332,7 +408,7 @@ class StreamManager:
                 time.sleep(1.0)
 
         # --- Phase 3: TERMINATING — cleanup ---
-        StreamManager._do_terminate(video_id, process, stderr_thread, stdout_reader)
+        StreamManager._do_terminate(video_id, process, stderr_thread, fragment_publisher)
 
         # Broadcast final STOPPED state (active_streams entry is now gone)
         if video_id in storage.videos:
@@ -377,22 +453,30 @@ class StreamManager:
             dash_dir = DASH_OUTPUT_DIR / str(video_id)
             dash_dir.mkdir(parents=True, exist_ok=True)
 
+            # One libx264 encoder for DASH; the progressive output is just a
+            # remux of the source bitstream (`-c:v copy`), so the FFI library
+            # gets a decodable fMP4 without paying for a second encode pass.
+            # This reverts the ~2× CPU regression introduced when the
+            # progressive branch was added with its own encoder.
             cmd = [
                 "ffmpeg",
                 "-v", "warning",
-                "-probesize", "50M",
-                "-analyzeduration", "100M",
+                # Probe only enough of the input to identify stream params.
+                # The previous 50M / 100M were scanning far more than needed
+                # and delayed the first output segment by several seconds,
+                # tripping INIT_TIMEOUT before the DVR could be populated.
+                "-probesize", "5M",
+                "-analyzeduration", "5M",
                 "-err_detect", "ignore_err",
                 "-re",
                 "-stream_loop", "-1",
                 "-fflags", "+genpts",
                 "-i", video_data["file_path"],
-                "-filter_complex",
-                f"[0:v]fps=fps={fps}[v_base]; [v_base]split=2[v_dash][v_prog]",
 
-                # --- DASH output ---
-                "-map", "[v_dash]",
+                # --- DASH output (re-encoded h264) ---
+                "-map", "0:v:0",
                 "-an",
+                "-vf", f"fps=fps={fps}",
                 "-c:v", "libx264",
                 "-pix_fmt", "yuv420p",
                 "-preset", "veryfast",
@@ -404,7 +488,14 @@ class StreamManager:
                 "-f", "dash",
                 "-seg_duration", str(DASH_SEGMENT_DURATION),
                 "-window_size", str(DASH_WINDOW_SIZE),
-                "-extra_window_size", "5",
+                # 30 extra segments (= 60 s at seg_duration=2) retained
+                # past the advertised MPD window. Covers the race between
+                # dash.js fetching an oldest-edge segment and ffmpeg's
+                # unlink on roll-off — the earlier 5-segment margin (10 s)
+                # was enough for happy-path timing but not for the actual
+                # client request latency + FS ops, which is what produced
+                # the oldest-edge freeze.
+                "-extra_window_size", "30",
                 "-remove_at_exit", "1",
                 "-streaming", "1",
                 "-ldash", "1",
@@ -412,15 +503,10 @@ class StreamManager:
                 "-use_timeline", "1",
                 str(dash_dir / "manifest.mpd"),
 
-                # --- Progressive fMP4 → stdout ---
-                "-map", "[v_prog]",
+                # --- Progressive fMP4 → stdout (remux only, no re-encode) ---
+                "-map", "0:v:0",
                 "-an",
-                "-c:v", "libx264",
-                "-pix_fmt", "yuv420p",
-                "-preset", "ultrafast",
-                "-tune", "zerolatency",
-                "-b:v", "2M",
-                "-g", keyframe_interval,
+                "-c:v", "copy",
                 "-f", "mp4",
                 "-movflags", "frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
                 "-frag_duration", "200000",
@@ -445,8 +531,7 @@ class StreamManager:
                 "start_time_ms": int(time.time() * 1000),
                 "dash_manifest_url": f"/dash/{video_id}/manifest.mpd",
                 "prog_init_ready": threading.Event(),
-                "consumer_queue": None,
-                "prog_consumer_active": False,
+                "hub": ProgressiveHub(),
             }
 
             broadcast_sync(

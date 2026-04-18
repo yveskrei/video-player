@@ -1,11 +1,16 @@
-//! Bounded async queue, ringbuffer on overflow: oldest is dropped to make
-//! room for the newest. Matches library/src/queue.rs semantically.
+//! Bounded queue with ringbuffer-on-overflow (oldest dropped to make room
+//! for newest). Inner lock is `std::sync::Mutex` so synchronous callers
+//! (the FFI `PostResults` entry point) can enqueue without an async
+//! runtime and without ever failing on contention — the OS blocks on the
+//! lock for the ~microsecond the async receiver holds it. The async
+//! `recv` never `.await`s while holding the lock, so mixing std and tokio
+//! primitives is safe here.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
-use tokio::sync::{Mutex, Notify};
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
-use anyhow::{bail, Result};
+use anyhow::{Context, Result};
 
 type OnDrop<T> = Arc<dyn Fn(T) + Send + Sync>;
 
@@ -62,25 +67,28 @@ impl<T> Clone for FixedSizeQueueSender<T> {
 
 impl<T> FixedSizeQueueSender<T> {
     pub fn send_sync(&self, item: T) -> Result<()> {
-        match self.queue.try_lock() {
-            Ok(mut q) => {
-                if q.len() >= self.capacity {
-                    if let Some(dropped) = q.pop_front() {
-                        if let Some(cb) = self.on_drop.as_ref() { cb(dropped); }
-                    }
-                }
-                q.push_back(item);
-                drop(q);
-                self.notify.notify_one();
-                Ok(())
+        // Blocking acquire. The only error path is mutex poisoning — i.e.
+        // another thread panicked while holding the lock — which we surface
+        // so the caller can decide how to recover rather than hiding it.
+        let mut q = self
+            .queue
+            .lock()
+            .map_err(|_| anyhow::anyhow!("queue mutex poisoned"))
+            .context("post queue send")?;
+        if q.len() >= self.capacity {
+            if let Some(dropped) = q.pop_front() {
+                if let Some(cb) = self.on_drop.as_ref() { cb(dropped); }
             }
-            Err(_) => bail!("queue lock contended"),
         }
+        q.push_back(item);
+        drop(q);
+        self.notify.notify_one();
+        Ok(())
     }
 
     #[allow(dead_code)]
     pub async fn send_async(&self, item: T) {
-        let mut q = self.queue.lock().await;
+        let mut q = self.queue.lock().expect("queue mutex poisoned");
         if q.len() >= self.capacity {
             if let Some(dropped) = q.pop_front() {
                 if let Some(cb) = self.on_drop.as_ref() { cb(dropped); }
@@ -100,11 +108,17 @@ pub struct FixedSizeQueueReceiver<T> {
 impl<T> FixedSizeQueueReceiver<T> {
     pub async fn recv(&self) -> Option<T> {
         loop {
-            let mut q = self.queue.lock().await;
-            if let Some(item) = q.pop_front() { return Some(item); }
-            let notified = self.notify.notified();
-            drop(q);
-            notified.await;
+            // Inner block ensures the lock guard is dropped before we `.await`
+            // below. Holding a std::sync::MutexGuard across an await would
+            // break the Send bound on this future; dropping it here keeps
+            // the future Send and safely decouples the two primitives.
+            {
+                let mut q = self.queue.lock().expect("queue mutex poisoned");
+                if let Some(item) = q.pop_front() {
+                    return Some(item);
+                }
+            }
+            self.notify.notified().await;
         }
     }
 }

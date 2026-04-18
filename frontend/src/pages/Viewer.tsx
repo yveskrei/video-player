@@ -6,12 +6,12 @@ import { getBackendUrl } from '../api/client';
 import type { VideoInfo, BBox, VideoUpdateMessage, ClipSelection } from '../types';
 import { VideoPlayer } from '../components/VideoPlayer';
 import { BBoxOverlay } from '../components/BBoxOverlay';
-import { PlayerControls } from '../components/PlayerControls';
+import { PlayerControls } from '../components/player/PlayerControls';
 import { StreamCard } from '../components/StreamCard';
 import { useWebSocket } from '../hooks/useWebSocket';
-import { useVideoRecorder } from '../hooks/useVideoRecorder';
+import { useLiveRecorder } from '../hooks/useLiveRecorder';
 import { useDvrPlayer } from '../hooks/useDvrPlayer';
-import { exportDvrClip } from '../utils/exportDvrClip';
+import { useClipExport } from '../hooks/useClipExport';
 import { RefreshCw, Tv } from 'lucide-react';
 import clsx from 'clsx';
 
@@ -28,17 +28,27 @@ export const Viewer: React.FC = () => {
     const [selectedStreamId, setSelectedStreamId] = useState<number | null>(null);
     const [manifestUrl, setManifestUrl] = useState<string | null>(null);
 
-    const [minConfidence, setMinConfidence] = useState(0.0);
+    const [minConfidence, setMinConfidence] = useState(0.5);
     const [retentionFrames, setRetentionFrames] = useState(1);
     const [showBBoxes, setShowBBoxes] = useState(true);
+    // Analytics are locked OFF while the historical-bbox fetch is in flight
+    // for a freshly-selected stream. Showing them mid-load produces a
+    // jarring "incomplete" strip that fills in progressively over a few
+    // seconds. Better UX is to hide entirely, disable the toggle, then
+    // flip them on once history has landed.
+    const [analyticsLocked, setAnalyticsLocked] = useState(false);
+    // `playerReady` gates the player UI on "dash.js has seeked to live and
+    // is playing" instead of showing the bare black <video> + the seekbar
+    // briefly reading as DVR before auto-play snaps to live. Once granted
+    // for a stream it stays granted — seeking into DVR doesn't demote it.
+    const [playerReady, setPlayerReady] = useState(false);
 
     const [originalRes, setOriginalRes] = useState({ width: 0, height: 0 });
     const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
     const [videoOffset, setVideoOffset] = useState({ x: 0, y: 0 });
 
     const [clipSelection, setClipSelection] = useState<ClipSelection | null>(null);
-    const [exportProgress, setExportProgress] = useState<number | null>(null);
-    const exportToastIdRef = useRef<string | null>(null);
+    const { isExporting, progress: exportProgress, exportClip } = useClipExport();
 
     const [isFullscreen, setIsFullscreen] = useState(false);
     const [showControls, setShowControls] = useState(true);
@@ -58,28 +68,60 @@ export const Viewer: React.FC = () => {
     const videoRef = useRef<HTMLVideoElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const playerBoxRef = useRef<HTMLDivElement>(null);
-    const requestRef = useRef<number>(null);
     const selectedStreamIdRef = useRef<number | null>(null);
 
     useEffect(() => {
         selectedStreamIdRef.current = selectedStreamId;
     }, [selectedStreamId]);
 
-    const dvr = useDvrPlayer(videoRef);
+    // DVR window size and stream-start timestamp both come from the backend
+    // in VideoInfo. useDvrPlayer uses the latter as an authoritative
+    // wall-clock reference for the live edge — no more inferring from dash
+    // .js's jittery getDvrWindow() output.
+    const selectedStreamInfo = selectedStreamId !== null
+        ? streams.find(s => s.id === selectedStreamId)
+        : undefined;
+    const dvrWindowSec = selectedStreamInfo?.dvr_window_seconds ?? 300;
+    const streamStartMs = selectedStreamInfo?.stream_start_time_ms ?? null;
+
+    const dvr = useDvrPlayer(videoRef, dvrWindowSec, streamStartMs);
     const isLive = dvr.state.isLive;
 
-    const [bboxGroups, setBboxGroups] = useState<Map<number, BBox[]>>(new Map());
-    const bboxGroupsRef = useRef(bboxGroups);
-    useEffect(() => { bboxGroupsRef.current = bboxGroups; }, [bboxGroups]);
+    // bboxGroupsRef is the hot-path source of truth. Drain/trim/history
+    // merging all mutate it in place. `bboxGroups` state is a throttled mirror
+    // (at most 2Hz) for consumers that render by React (the Seekbar cluster
+    // list). This keeps per-message setState cascades off the main thread —
+    // 30 bbox msgs/sec × full Map-clone × Seekbar re-render was saturating it
+    // enough to stutter the <video> element.
+    const bboxGroupsRef = useRef<Map<number, BBox[]>>(new Map());
+    const [bboxGroups, setBboxGroups] = useState<Map<number, BBox[]>>(bboxGroupsRef.current);
+    const stateMirrorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const scheduleStateMirror = useCallback(() => {
+        if (stateMirrorTimerRef.current !== null) return;
+        stateMirrorTimerRef.current = setTimeout(() => {
+            stateMirrorTimerRef.current = null;
+            setBboxGroups(new Map(bboxGroupsRef.current));
+        }, 500);
+    }, []);
+    useEffect(() => () => {
+        if (stateMirrorTimerRef.current !== null) clearTimeout(stateMirrorTimerRef.current);
+    }, []);
 
-    const [activeBBoxes, setActiveBBoxes] = useState<BBox[]>([]);
+    // Active bboxes for the current video frame live in a ref, not React
+    // state. The overlay reads the ref on every draw; the `activeVersion`
+    // counter is bumped only when content actually changes so the overlay
+    // can skip redraws when nothing is different.
+    const activeBBoxesRef = useRef<BBox[]>([]);
+    const activeVersionRef = useRef<number>(0);
+    const recorderBBoxesRef = useRef<BBox[]>([]);
 
-    const { recordingDuration, saveRecording } = useVideoRecorder({
+    const { recordingDuration, saveRecording } = useLiveRecorder({
         videoRef,
-        bboxes: showBBoxes ? activeBBoxes : [],
+        bboxesRef: recorderBBoxesRef,
         originalWidth: originalRes.width,
         originalHeight: originalRes.height,
         minConfidence,
+        showBBoxes,
         enabled: isLive && selectedStreamId !== null,
     });
 
@@ -91,12 +133,20 @@ export const Viewer: React.FC = () => {
     // Stream lifecycle
     // -------------------------------------------------------------------
 
+    const historyFetchedForRef = useRef<number | null>(null);
+
     const handleStopWatching = useCallback(() => {
         setSelectedStreamId(null);
         setManifestUrl(null);
         setOriginalRes({ width: 0, height: 0 });
+        bboxGroupsRef.current = new Map();
+        historyFetchedForRef.current = null;
+        maxDeletionPtsRef.current = 0;
         setBboxGroups(new Map());
         setClipSelection(null);
+        setAnalyticsLocked(false);
+        setShowBBoxes(true);
+        setPlayerReady(false);
         setSearchParams(prev => {
             const next = new URLSearchParams(prev);
             next.delete('stream_id');
@@ -146,35 +196,41 @@ export const Viewer: React.FC = () => {
     const drainBboxBuffer = useCallback(() => {
         const buf = bboxBuffer.current;
         if (buf.length === 0) return;
-        const additions: Array<[number, BBox[]]> = [];
-        for (const msg of buf) additions.push([msg.pts, msg.bboxes]);
+        const groups = bboxGroupsRef.current;
+        for (const msg of buf) {
+            const existing = groups.get(msg.pts);
+            if (existing) existing.push(...msg.bboxes);
+            else groups.set(msg.pts, msg.bboxes);
+        }
         buf.length = 0;
-        if (additions.length === 0) return;
-        setBboxGroups(prev => {
-            const next = new Map(prev);
-            for (const [pts, bboxes] of additions) {
-                const existing = next.get(pts);
-                next.set(pts, existing ? [...existing, ...bboxes] : bboxes);
-            }
-            return next;
-        });
-    }, [bboxBuffer]);
+        scheduleStateMirror();
+    }, [bboxBuffer, scheduleStateMirror]);
 
+    // Monotonic deletion threshold — only advances. A temporary dip in
+    // dvrStart would otherwise nuke bboxes we had already received and
+    // that are still within the backend's retention window. Once deleted
+    // they're gone until a page refresh, so we refuse to delete on backward
+    // movements, AND we keep a generous cushion below the current dvrStart
+    // (`BBOX_CLEANUP_BUFFER_SEC`) so a small rewind or MPD re-poll that
+    // momentarily nudges dvrStart forward doesn't evict pts that will
+    // shortly reappear in the visible window.
+    const BBOX_CLEANUP_BUFFER_SEC = 30;
+    const maxDeletionPtsRef = useRef<number>(0);
     useEffect(() => {
         if (!dvr.state.isReady || dvr.state.dvrWindowSize <= 0) return;
-        const minPts = dvr.state.dvrStart * PTS_TIMEBASE;
-        setBboxGroups(prev => {
-            let changed = false;
-            const next = new Map(prev);
-            for (const pts of next.keys()) {
-                if (pts < minPts) {
-                    next.delete(pts);
-                    changed = true;
-                }
+        const minPts = Math.max(0, (dvr.state.dvrStart - BBOX_CLEANUP_BUFFER_SEC) * PTS_TIMEBASE);
+        if (minPts <= maxDeletionPtsRef.current) return;
+        maxDeletionPtsRef.current = minPts;
+        const groups = bboxGroupsRef.current;
+        let changed = false;
+        for (const pts of groups.keys()) {
+            if (pts < minPts) {
+                groups.delete(pts);
+                changed = true;
             }
-            return changed ? next : prev;
-        });
-    }, [dvr.state.dvrStart, dvr.state.dvrWindowSize, dvr.state.isReady]);
+        }
+        if (changed) scheduleStateMirror();
+    }, [dvr.state.dvrStart, dvr.state.dvrWindowSize, dvr.state.isReady, scheduleStateMirror]);
 
     const fetchStreams = useCallback(async () => {
         try {
@@ -197,7 +253,7 @@ export const Viewer: React.FC = () => {
 
     const autoSelectedRef = useRef(false);
 
-    const handleStreamSelect = useCallback(async (id: number) => {
+    const handleStreamSelect = useCallback((id: number) => {
         const stream = streams.find(s => s.id === id);
         if (!stream?.dash_manifest_url) {
             toast.error('No DASH manifest available for this stream');
@@ -209,26 +265,69 @@ export const Viewer: React.FC = () => {
         }
 
         autoSelectedRef.current = true;
+        bboxGroupsRef.current = new Map();
+        historyFetchedForRef.current = null;
+        maxDeletionPtsRef.current = 0;
         setSelectedStreamId(id);
         setManifestUrl(stream.dash_manifest_url);
         setBboxGroups(new Map());
         setClipSelection(null);
+        // Lock analytics until historical bbox fetch resolves (see the
+        // effect further down). Hides the overlay + seekbar strip so the
+        // user doesn't see a partial view mid-load.
+        setAnalyticsLocked(true);
+        setShowBBoxes(false);
+        // Gate the player UI until dash.js has seeked to live. Otherwise
+        // the user sees a black <video> with the seekbar briefly reading
+        // "DVR" before auto-play snaps to the live edge.
+        setPlayerReady(false);
         setSearchParams(prev => {
             const next = new URLSearchParams(prev);
             next.set('stream_id', String(id));
             return next;
         }, { replace: true });
         subscribe(id);
-
-        try {
-            const history = await listBboxes(id);
-            const seeded = new Map<number, BBox[]>();
-            for (const g of history.groups) seeded.set(g.pts, g.bboxes);
-            setBboxGroups(seeded);
-        } catch (e) {
-            console.warn('Failed to fetch historical bboxes', e);
-        }
+        // History is fetched by the effect below once the player reports
+        // ready — parsing ~MB of JSON on the main thread while dash.js is
+        // booting is what made first-frame feel like "forever".
     }, [streams, subscribe, unsubscribe, setSearchParams]);
+
+    // Deferred history hydration: runs once per selected stream, only after
+    // dvrState.isReady so the video has a chance to start before we bring a
+    // potentially-huge historical bbox dump onto the main thread. When the
+    // fetch settles (success or failure) we release the analytics lock and
+    // flip showBBoxes back on so the overlay/strip appear fully populated
+    // at once.
+    useEffect(() => {
+        const id = selectedStreamId;
+        if (id === null || !dvr.state.isReady) return;
+        if (historyFetchedForRef.current === id) return;
+        historyFetchedForRef.current = id;
+        let cancelled = false;
+        (async () => {
+            try {
+                const history = await listBboxes(id);
+                if (cancelled || selectedStreamIdRef.current !== id) return;
+                const groups = bboxGroupsRef.current;
+                let changed = false;
+                for (const g of history.groups) {
+                    if (!groups.has(g.pts)) {
+                        groups.set(g.pts, g.bboxes);
+                        changed = true;
+                    }
+                }
+                if (changed) scheduleStateMirror();
+            } catch (e) {
+                console.warn('Failed to fetch historical bboxes', e);
+            } finally {
+                if (!cancelled && selectedStreamIdRef.current === id) {
+                    setAnalyticsLocked(false);
+                    setShowBBoxes(true);
+                }
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [selectedStreamId, dvr.state.isReady, scheduleStateMirror]);
 
     const handleStopWatchingWithUnsub = useCallback(() => {
         if (selectedStreamIdRef.current !== null) unsubscribe(selectedStreamIdRef.current);
@@ -295,39 +394,60 @@ export const Viewer: React.FC = () => {
     }, [selectedStreamId, originalRes]);
 
     // -------------------------------------------------------------------
-    // BBox sync animation loop
+    // BBox sync animation loop — writes to refs, never to React state, so
+    // the overlay's own RAF loop picks up the new set without re-rendering
+    // the Viewer / controls tree on every video frame.
     // -------------------------------------------------------------------
-    const animate = useCallback(() => {
-        drainBboxBuffer();
-
-        if (!videoRef.current || !selectedStreamId) {
-            requestRef.current = requestAnimationFrame(animate);
-            return;
-        }
-
-        const currentTime = videoRef.current.currentTime;
-        const currentPts = currentTime * PTS_TIMEBASE;
-        const ptsPerFrame = 3000;
-        const tolerance = ptsPerFrame * 2;
-        const retentionWindow = ptsPerFrame * retentionFrames;
-
-        const active: BBox[] = [];
-        for (const [pts, bboxes] of bboxGroupsRef.current) {
-            if (pts <= currentPts + tolerance && pts >= currentPts - retentionWindow) {
-                active.push(...bboxes);
-            }
-        }
-
-        setActiveBBoxes(active);
-        requestRef.current = requestAnimationFrame(animate);
-    }, [selectedStreamId, retentionFrames, drainBboxBuffer]);
+    const showBBoxesRef = useRef(showBBoxes);
+    useEffect(() => { showBBoxesRef.current = showBBoxes; }, [showBBoxes]);
+    const retentionFramesRef = useRef(retentionFrames);
+    useEffect(() => { retentionFramesRef.current = retentionFrames; }, [retentionFrames]);
+    const selectedStreamIdForAnimRef = useRef(selectedStreamId);
+    useEffect(() => { selectedStreamIdForAnimRef.current = selectedStreamId; }, [selectedStreamId]);
 
     useEffect(() => {
-        requestRef.current = requestAnimationFrame(animate);
-        return () => {
-            if (requestRef.current) cancelAnimationFrame(requestRef.current);
+        let raf = 0;
+        const loop = () => {
+            drainBboxBuffer();
+            const video = videoRef.current;
+            const streamId = selectedStreamIdForAnimRef.current;
+            if (video && streamId !== null) {
+                // Recompute every RAF — no currentTime-change gate. Browsers
+                // can stutter their currentTime reporting even while the
+                // video is actively playing, and gating left the overlay
+                // painting a stale frame for seconds. Per-tick iteration of
+                // bboxGroupsRef is cheap (~9k keys max) and the overlay's
+                // 30 Hz redraw picks up changes immediately.
+                const currentPts = video.currentTime * PTS_TIMEBASE;
+                const ptsPerFrame = 3000;
+                const tolerance = ptsPerFrame;
+                // retentionFrames = N → show the current frame plus N−1 prior
+                // frames (user-defined semantics). Always include a 1-frame
+                // forward tolerance so bboxes that arrive a tick before the
+                // matching video frame still get rendered.
+                const retentionWindow = ptsPerFrame * Math.max(0, retentionFramesRef.current - 1);
+                const lo = currentPts - retentionWindow;
+                const hi = currentPts + tolerance;
+
+                const active: BBox[] = [];
+                for (const [pts, bboxes] of bboxGroupsRef.current) {
+                    if (pts >= lo && pts <= hi) {
+                        for (const b of bboxes) active.push(b);
+                    }
+                }
+                activeBBoxesRef.current = active;
+                recorderBBoxesRef.current = showBBoxesRef.current ? active : [];
+                activeVersionRef.current++;
+            } else if (activeBBoxesRef.current.length > 0) {
+                activeBBoxesRef.current = [];
+                recorderBBoxesRef.current = [];
+                activeVersionRef.current++;
+            }
+            raf = requestAnimationFrame(loop);
         };
-    }, [animate]);
+        raf = requestAnimationFrame(loop);
+        return () => cancelAnimationFrame(raf);
+    }, [drainBboxBuffer, videoRef]);
 
     // -------------------------------------------------------------------
     // Clip selection
@@ -343,47 +463,50 @@ export const Viewer: React.FC = () => {
         };
     }, [dvr.state]);
 
+    // Once dash.js is both manifest-ready and has seeked to live, consider
+    // the player fully loaded. We don't demote this flag back to false when
+    // the user seeks into DVR — the initial black-screen → auto-snap-to-
+    // live transition is the only window we want to hide.
+    useEffect(() => {
+        if (selectedStreamId === null) return;
+        if (!dvr.state.isReady || !dvr.state.isLive) return;
+        setPlayerReady(true);
+    }, [selectedStreamId, dvr.state.isReady, dvr.state.isLive]);
+
+    // If the playhead lands on live (either via BACK TO LIVE or by naturally
+    // catching up to the live edge), the clip-selection overlay is no longer
+    // meaningful — the "Create clip"/"Save clip" buttons have already been
+    // swapped out for "Save last Xs", so we drop the overlay here too.
+    useEffect(() => {
+        if (clipSelection && dvr.state.isLive) setClipSelection(null);
+    }, [clipSelection, dvr.state.isLive]);
+
+    // Cancel the clip when it slides off the left edge of the DVR. Otherwise
+    // the yellow box tries to render at a negative pixel position — visually
+    // "beyond the boundaries" — and the user has likely forgotten they
+    // created a selection anyway.
     useEffect(() => {
         if (!clipSelection) return;
-        const { duration } = dvr.state;
-        const lengthSec = (clipSelection.endPts - clipSelection.startPts) / PTS_TIMEBASE;
-        const startSec = clipSelection.startPts / PTS_TIMEBASE;
-        const idealEndSec = startSec + DEFAULT_CLIP_SEC;
-        if (lengthSec < DEFAULT_CLIP_SEC && idealEndSec <= duration) {
-            const newEndSec = Math.min(idealEndSec, duration);
-            setClipSelection({
-                startPts: clipSelection.startPts,
-                endPts: Math.round(newEndSec * PTS_TIMEBASE),
-            });
+        if (!dvr.state.isReady) return;
+        const clipStartSec = clipSelection.startPts / PTS_TIMEBASE;
+        if (clipStartSec < dvr.state.dvrStart) {
+            setClipSelection(null);
         }
-    }, [dvr.state.duration, clipSelection]);
-
-    const shiftClipSelectionBy = useCallback((deltaSec: number) => {
-        setClipSelection(prev => {
-            if (!prev) return prev;
-            const { duration, dvrStart } = dvr.state;
-            const lengthSec = (prev.endPts - prev.startPts) / PTS_TIMEBASE;
-            let startSec = prev.startPts / PTS_TIMEBASE + deltaSec;
-            if (startSec < dvrStart) startSec = dvrStart;
-            if (startSec + lengthSec > duration) startSec = Math.max(dvrStart, duration - lengthSec);
-            return {
-                startPts: Math.round(startSec * PTS_TIMEBASE),
-                endPts: Math.round((startSec + lengthSec) * PTS_TIMEBASE),
-            };
-        });
-    }, [dvr.state]);
+    }, [clipSelection, dvr.state.dvrStart, dvr.state.isReady]);
 
     // -------------------------------------------------------------------
     // Seek / transport
     // -------------------------------------------------------------------
     const handleSeekTo = useCallback((t: number) => { dvr.seekTo(t); }, [dvr]);
 
+    // Skip does not shift the clip: the clip is anchored to an absolute PTS
+    // range by design, so seeking around it leaves the selection where the
+    // user put it.
     const handleSeekBy = useCallback((delta: number) => {
         if (delta > 0 && dvr.state.isLive) return;
         dvr.seekBy(delta);
-        if (clipSelection) shiftClipSelectionBy(delta);
         showSkipFeedback(delta);
-    }, [dvr, clipSelection, shiftClipSelectionBy, showSkipFeedback]);
+    }, [dvr, showSkipFeedback]);
 
     const handleBackToLive = useCallback(() => {
         setClipSelection(null);
@@ -402,46 +525,25 @@ export const Viewer: React.FC = () => {
     const handleSaveLiveClip = useCallback(() => { saveRecording(); }, [saveRecording]);
 
     const handleSaveDvrClip = useCallback(async () => {
-        if (!clipSelection || !manifestUrl || !selectedStreamId) return;
+        if (!clipSelection || !manifestUrl || !selectedStreamId || isExporting) return;
         const lengthSec = (clipSelection.endPts - clipSelection.startPts) / PTS_TIMEBASE;
         if (lengthSec > MAX_CLIP_SEC) {
             toast.error(`Clip is too long (max ${MAX_CLIP_SEC}s)`);
             return;
         }
-        const fullManifestUrl = manifestUrl.startsWith('http')
-            ? manifestUrl
-            : `${getBackendUrl()}${manifestUrl}`;
-
-        setExportProgress(0);
-        const tid = toast.loading('Exporting clip… 0%');
-        exportToastIdRef.current = tid;
-        try {
-            await exportDvrClip({
-                backendUrl: getBackendUrl(),
-                videoId: selectedStreamId,
-                manifestUrl: fullManifestUrl,
-                startPts: clipSelection.startPts,
-                endPts: clipSelection.endPts,
-                bboxGroups: bboxGroupsRef.current,
-                showBBoxes,
-                minConfidence,
-                originalWidth: originalRes.width,
-                originalHeight: originalRes.height,
-                onProgress: (f) => {
-                    setExportProgress(f);
-                    toast.loading(`Exporting clip… ${Math.round(f * 100)}%`, { id: tid });
-                },
-            });
-            toast.success('Clip saved', { id: tid });
-            setClipSelection(null);
-        } catch (e) {
-            console.error(e);
-            toast.error(`Export failed: ${(e as Error).message}`, { id: tid });
-        } finally {
-            setExportProgress(null);
-            exportToastIdRef.current = null;
-        }
-    }, [clipSelection, manifestUrl, selectedStreamId, showBBoxes, minConfidence, originalRes]);
+        const ok = await exportClip({
+            videoId: selectedStreamId,
+            manifestUrl,
+            startPts: clipSelection.startPts,
+            endPts: clipSelection.endPts,
+            bboxGroups: bboxGroupsRef.current,
+            showBBoxes,
+            minConfidence,
+            originalWidth: originalRes.width,
+            originalHeight: originalRes.height,
+        });
+        if (ok) setClipSelection(null);
+    }, [clipSelection, manifestUrl, selectedStreamId, isExporting, exportClip, showBBoxes, minConfidence, originalRes]);
 
     // -------------------------------------------------------------------
     // Fullscreen
@@ -513,15 +615,6 @@ export const Viewer: React.FC = () => {
     }, [selectedStreamId, handleTogglePlay, handleToggleFullscreen, handleSeekBy, clipSelection, resetHideControls]);
 
     // -------------------------------------------------------------------
-    // Pause-at-oldest manifest throttle
-    // -------------------------------------------------------------------
-    useEffect(() => {
-        const atOldest = dvr.state.isReady && (dvr.state.playhead - dvr.state.dvrStart) < 1;
-        const shouldThrottle = dvr.state.isPaused && atOldest;
-        dvr.setManifestPollPaused(shouldThrottle);
-    }, [dvr, dvr.state.isPaused, dvr.state.playhead, dvr.state.dvrStart, dvr.state.isReady]);
-
-    // -------------------------------------------------------------------
     // Render
     // -------------------------------------------------------------------
     const getFullManifestUrl = (path: string) => path.startsWith('http') ? path : `${getBackendUrl()}${path}`;
@@ -535,7 +628,7 @@ export const Viewer: React.FC = () => {
         handleToggleFullscreen();
     }, [handleToggleFullscreen]);
 
-    const shouldShowControls = showControls || dvr.state.isPaused || !!clipSelection || exportProgress !== null;
+    const shouldShowControls = playerReady && (showControls || dvr.state.isPaused || !!clipSelection || exportProgress !== null);
 
     // ================================================================
     // Grid view — shown when no stream is selected.
@@ -598,24 +691,46 @@ export const Viewer: React.FC = () => {
             >
                 <div ref={containerRef} className="relative h-full w-full">
                     {manifestUrl && (
-                        <VideoPlayer
-                            ref={videoRef}
-                            manifestUrl={getFullManifestUrl(manifestUrl)}
-                            onResolutionChange={(w, h) => setOriginalRes({ width: w, height: h })}
-                            onError={(err) => { toast.error(err); handleStopWatchingWithUnsub(); }}
-                            onPlayerReady={dvr.setPlayer}
+                        <div
+                            className={clsx(
+                                'absolute inset-0 transition-opacity duration-200',
+                                playerReady ? 'opacity-100' : 'opacity-0',
+                            )}
+                        >
+                            <VideoPlayer
+                                ref={videoRef}
+                                manifestUrl={getFullManifestUrl(manifestUrl)}
+                                onResolutionChange={(w, h) => setOriginalRes({ width: w, height: h })}
+                                onError={(err) => { toast.error(err); handleStopWatchingWithUnsub(); }}
+                                onPlayerReady={dvr.setPlayer}
+                            />
+                        </div>
+                    )}
+
+                    {/* Loading overlay — shown until dash.js is at live. */}
+                    {!playerReady && (
+                        <div className="absolute inset-0 z-[2] flex items-center justify-center bg-black">
+                            <div className="flex flex-col items-center gap-3 text-zinc-400">
+                                <div className="w-10 h-10 rounded-full border-2 border-zinc-700 border-t-primary animate-spin" />
+                                <span className="text-xs">Connecting to live…</span>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Click-to-play layer between the video and the controls.
+                        Disabled while loading so a mis-click can't pause a
+                        video the user can't see. */}
+                    {playerReady && (
+                        <div
+                            className="absolute inset-0 z-[1] cursor-pointer"
+                            onClick={handleVideoSurfaceClick}
+                            onDoubleClick={handleVideoSurfaceDblClick}
                         />
                     )}
 
-                    {/* Click-to-play layer between the video and the controls */}
-                    <div
-                        className="absolute inset-0 z-[1] cursor-pointer"
-                        onClick={handleVideoSurfaceClick}
-                        onDoubleClick={handleVideoSurfaceDblClick}
-                    />
-
                     <BBoxOverlay
-                        bboxes={activeBBoxes}
+                        bboxesRef={activeBBoxesRef}
+                        versionRef={activeVersionRef}
                         originalWidth={originalRes.width}
                         originalHeight={originalRes.height}
                         width={containerSize.width}
@@ -676,11 +791,13 @@ export const Viewer: React.FC = () => {
                     >
                         <PlayerControls
                             dvrState={dvr.state}
+                            windowSec={dvrWindowSec}
                             bboxGroups={bboxGroups}
                             clipSelection={clipSelection}
                             onClipSelectionChange={setClipSelection}
                             showBBoxes={showBBoxes}
                             onShowBBoxesChange={setShowBBoxes}
+                            analyticsLocked={analyticsLocked}
                             minConfidence={minConfidence}
                             onMinConfidenceChange={setMinConfidence}
                             retentionFrames={retentionFrames}

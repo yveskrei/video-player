@@ -1,14 +1,32 @@
+import asyncio
 from fastapi import HTTPException
 from storage import storage
 from models import BBoxCreate
 from enums import WebSocketEventType
+from stream_manager import DASH_SEGMENT_DURATION, DASH_WINDOW_SIZE
 import time
+
+# Strong references to in-flight broadcast tasks. asyncio.create_task only
+# holds a weak reference, so without this set the tasks can be garbage-
+# collected mid-flight — which silently drops the WS broadcast and the
+# frontend only sees bboxes after a full page refresh (via GET /bboxes/).
+_pending_broadcasts: "set[asyncio.Task]" = set()
 
 
 class BBoxManager:
     """Handles bounding box storage and WebSocket broadcasting"""
 
-    RETENTION_PERIOD_MS = 5 * 60 * 1000    # 5 minutes
+    # Derived from the FFmpeg DASH window so the bbox store always matches
+    # what the client can actually seek to. Changing the encoder's window
+    # size automatically widens / narrows retention accordingly — no second
+    # constant to keep in sync. The extra 5s is a safety margin against
+    # boundary-timing races (cleanup happens on each POST, so a bbox at the
+    # exact DVR left-edge could otherwise be stripped moments before the
+    # client finishes painting it). A gap at the left edge of the seekbar
+    # shorter than this is just library warmup: the time between backend
+    # stream-start and the FFI library's first successful decode/post.
+    RETENTION_MARGIN_SEC = 5
+    RETENTION_PERIOD_MS = (DASH_SEGMENT_DURATION * DASH_WINDOW_SIZE + RETENTION_MARGIN_SEC) * 1000
     STANDARD_TIME_BASE = 90000.0            # MPEG-TS 90 kHz
 
     @staticmethod
@@ -74,16 +92,23 @@ class BBoxManager:
 
         BBoxManager._cleanup_old_bboxes(video_id, current_time_ms)
 
+        # Fire-and-forget broadcast: awaiting it would serialise the POST
+        # response behind every subscriber's WS send, so a single slow client
+        # stalls the ingest pipeline. Detaching keeps /bboxes/ fast regardless.
+        # Each task is tracked in _pending_broadcasts so CPython's GC can't
+        # drop it before send_text completes.
         if websocket_manager:
             for pts, bboxes in pts_groups.items():
-                await websocket_manager.broadcast_bbox(video_id, {
+                task = asyncio.create_task(websocket_manager.broadcast_bbox(video_id, {
                     "type": WebSocketEventType.BBOX_UPDATE,
                     "video_id": video_id,
                     "pts": pts,
                     "bboxes": bboxes,
                     "stream_start_time_ms": stream_start_time_ms,
                     "timestamp": current_time_ms,
-                })
+                }))
+                _pending_broadcasts.add(task)
+                task.add_done_callback(_pending_broadcasts.discard)
 
         return {
             "source_id": video_id,

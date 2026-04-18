@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use tokio::runtime::Runtime;
 use tokio::sync::OnceCell;
-use tracing::warn;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -117,7 +116,7 @@ impl State {
         let cbody = match CString::new(body) {
             Ok(s) => s,
             Err(_) => {
-                warn!(source_id, "post-results body contained NUL; skipped");
+                tracing::warn!(source_id, "post-results body contained NUL; skipped");
                 return;
             }
         };

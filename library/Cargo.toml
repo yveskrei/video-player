@@ -1,7 +1,7 @@
 [package]
 name = "client_video"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
@@ -17,7 +17,7 @@ ffmpeg-next = { version = "7.1", features = ["static"] }
 
 [lib]
 crate-type = ["cdylib"]
-name = "ffi_client_video"
+name = "client_video"
 
 [profile.release]
 opt-level = 3

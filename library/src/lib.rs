@@ -1,4 +1,5 @@
 #![allow(clippy::uninlined_format_args)]
+#![allow(unsafe_op_in_unsafe_fn)]
 //! C ABI for the video-player FFI library: SetCallbacks, InitMultipleSources,
 //! StopSource, PostResults, FreeCPtr.
 
@@ -22,7 +23,7 @@ use crate::callbacks::{
 use crate::source::Source;
 use crate::state::get_state;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn SetCallbacks(
     source_frames: SourceFramesCallback,
     source_metadata: SourceMetadataCallback,
@@ -47,7 +48,7 @@ pub extern "C" fn SetCallbacks(
 
 /// # Safety
 /// `source_ids` must point to a readable array of `size` `c_int` values, or be null.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn InitMultipleSources(source_ids: *const c_int, size: c_int) {
     if source_ids.is_null() || size <= 0 {
         tracing::warn!(size, "InitMultipleSources: invalid args");
@@ -84,7 +85,7 @@ pub unsafe extern "C" fn InitMultipleSources(source_ids: *const c_int, size: c_i
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn StopMultipleSources(source_ids: *const c_int, size: c_int) {
     let state = match get_state() {
         Ok(s) => s,
@@ -110,7 +111,7 @@ pub extern "C" fn StopMultipleSources(source_ids: *const c_int, size: c_int) {
 
 /// # Safety
 /// `json` must be a NUL-terminated UTF-8 string, or null.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn PostResults(source_id: c_int, json: *const c_char) -> c_int {
     if json.is_null() {
         tracing::warn!(source_id, "PostResults: null json");
@@ -146,7 +147,7 @@ pub unsafe extern "C" fn PostResults(source_id: c_int, json: *const c_char) -> c
 /// # Safety
 /// `ptr` must be either null, or a pointer previously handed to the caller by
 /// this library via a callback.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn FreeCPtr(ptr: *const c_void) {
     if ptr.is_null() {
         return;

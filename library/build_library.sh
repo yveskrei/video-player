@@ -59,4 +59,4 @@ export RUSTFLAGS="-C link-arg=-L$FFMPEG_DIR/lib \
 # output reproducible and avoids stale link-line state.
 cargo build --release
 
-echo "✅ Built $(ls -1 target/release/libffi_client_video.so 2>/dev/null || echo 'target/release/libffi_client_video.so not found')"
+echo "✅ Built $(ls -1 target/release/libclient_video.so 2>/dev/null || echo 'target/release/libclient_video.so not found')"

@@ -2,11 +2,13 @@
 #
 # Builds a minimal, decoder-only FFmpeg statically for the ffi_library crate.
 #
-# Unlike the old `library/build_dependencies.sh` this script drops every
-# encoder (x264/x265/libvpx/libmp3lame/libopus), every audio path, libsrt +
-# OpenSSL, and the libxcb/libXau/libXdmcp stack — the FFI library only needs
-# to *decode* H.264 out of fragmented MP4, so the rest is dead weight that
-# used to add 30-60 minutes to the build for no runtime benefit.
+# This script is strictly offline — it expects the FFmpeg source tree to
+# already be present under dependencies/ffmpeg/src. Run download_dependencies.sh
+# first (on a machine with network access) to populate it.
+#
+# The FFI library only needs to *decode* H.264/HEVC out of fragmented MP4, so
+# every encoder (x264/x265/libvpx/libmp3lame/libopus), every audio path,
+# libsrt + OpenSSL, and the libxcb/libXau/libXdmcp stack is dropped.
 #
 # The result is a single FFmpeg install tree at dependencies/ffmpeg/ with
 # libavformat/avcodec/avutil/swscale built as static PIC libraries — no
@@ -19,20 +21,23 @@ PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
 DEPS_DIR="$PROJECT_ROOT/dependencies"
 FFMPEG_DIR="$DEPS_DIR/ffmpeg"
 FFMPEG_SRC="$FFMPEG_DIR/src"
-FFMPEG_VERSION="n6.1"
 
-if [ -d "$DEPS_DIR" ]; then
-  echo "Removing existing dependencies..."
-  rm -rf "$DEPS_DIR"
+if [ ! -d "$FFMPEG_SRC" ]; then
+  echo "❌ FFmpeg source not found at $FFMPEG_SRC" >&2
+  echo "   Run ./download_dependencies.sh first." >&2
+  exit 1
 fi
-mkdir -p "$DEPS_DIR"
 
-# Download FFmpeg (shallow clone — we don't need history).
-echo "Downloading FFmpeg $FFMPEG_VERSION..."
-git clone --depth 1 --branch "$FFMPEG_VERSION" https://github.com/FFmpeg/FFmpeg.git "$FFMPEG_SRC"
+# Clean previous install artifacts but keep the downloaded source tree.
+for sub in include lib share bin; do
+  rm -rf "$FFMPEG_DIR/$sub"
+done
 
 echo "Configuring FFmpeg (decoder-only)..."
 cd "$FFMPEG_SRC"
+
+# Reset any stale build state from a previous run; ignore if never configured.
+make distclean >/dev/null 2>&1 || true
 
 ./configure \
   --prefix="$FFMPEG_DIR" \

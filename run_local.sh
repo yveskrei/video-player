@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Run backend server in dev mode
-cd ./backend && uv run uvicorn main:app --reload --host 0.0.0.0 --port 8705 &
+cd ./backend && uv run uvicorn main:app --reload --host 0.0.0.0 --port 8702 &
 BACKEND_PID=$!
 
 # Run frontend in dev mode

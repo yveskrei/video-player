@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import clsx from 'clsx';
 import {
     Play, Pause, SkipBack, SkipForward, Settings as SettingsIcon,
@@ -13,7 +13,6 @@ const PTS_TIMEBASE = 90000;
 
 interface Props {
     dvrState: DvrState;
-    windowSec: number;
 
     bboxGroups: Map<number, BBox[]>;
     showBBoxes: boolean;
@@ -45,7 +44,7 @@ interface Props {
 
 export const PlayerControls: React.FC<Props> = (props) => {
     const {
-        dvrState, windowSec,
+        dvrState,
         bboxGroups, showBBoxes, onShowBBoxesChange, analyticsLocked,
         minConfidence, onMinConfidenceChange,
         retentionFrames, onRetentionFramesChange,
@@ -60,6 +59,21 @@ export const PlayerControls: React.FC<Props> = (props) => {
 
     const { isLive, isPaused, playhead, duration } = dvrState;
     const behindLive = Math.max(0, duration - playhead);
+
+    // Hysteresis for the "-MM:SS" label. `behindLive` jitters by ~50-100ms
+    // because `duration` advances on dash.js's 100ms wallclock tick and
+    // `playhead` advances on the video element's frame cadence; when the
+    // value lands near an integer boundary (e.g. 125.03 / 124.98) a naive
+    // round-and-display flips the shown integer every tick. We lock in the
+    // displayed integer once and only re-compute when `behindLive` has
+    // moved by > 0.7s from the locked value — far enough to be a genuine
+    // change, not jitter.
+    const [displayBehindLive, setDisplayBehindLive] = useState(Math.round(behindLive));
+    useEffect(() => {
+        setDisplayBehindLive(prev => (
+            Math.abs(behindLive - prev) >= 0.7 ? Math.round(behindLive) : prev
+        ));
+    }, [behindLive]);
 
     const saveButton = renderSaveButton({
         isLive,
@@ -83,7 +97,7 @@ export const PlayerControls: React.FC<Props> = (props) => {
                             : 'bg-zinc-900/70 text-zinc-200 border-white/10',
                     )}
                 >
-                    {isLive ? 'LIVE' : formatBehindLive(behindLive)}
+                    {isLive ? 'LIVE' : formatBehindLive(displayBehindLive)}
                 </div>
                 {clipSelection && !isLive && (
                     <div className="px-1.5 py-0.5 rounded text-[10px] font-mono border bg-amber-500/15 text-amber-200 border-amber-400/30 leading-none">
@@ -99,7 +113,6 @@ export const PlayerControls: React.FC<Props> = (props) => {
 
             <Seekbar
                 dvrState={dvrState}
-                windowSec={windowSec}
                 bboxGroups={bboxGroups}
                 minConfidence={minConfidence}
                 showBBoxes={showBBoxes && !analyticsLocked}

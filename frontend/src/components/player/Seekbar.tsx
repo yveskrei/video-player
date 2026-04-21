@@ -7,7 +7,7 @@ import { ClipOverlay } from './ClipOverlay';
 
 export const formatBehindLive = (secBehind: number): string => {
     if (secBehind <= 0.5) return 'LIVE';
-    const total = Math.floor(secBehind);
+    const total = Math.round(secBehind);
     const hh = Math.floor(total / 3600);
     const mm = Math.floor((total % 3600) / 60);
     const ss = total % 60;
@@ -17,13 +17,6 @@ export const formatBehindLive = (secBehind: number): string => {
 
 interface Props {
     dvrState: DvrState;
-    // Full DVR window advertised by the backend, seconds. The seekbar renders
-    // [duration - windowSec, duration] as its x-axis so fill-bar position
-    // depends only on behind-live offset — constant across time when playing
-    // at a fixed DVR position. Prior versions stretched the bar across
-    // [dvrStart, duration] which drifted when either end moved relative to
-    // playhead.
-    windowSec: number;
     bboxGroups: Map<number, BBox[]>;
     minConfidence: number;
     showBBoxes: boolean;
@@ -32,9 +25,15 @@ interface Props {
     onSeek: (timeSec: number) => void;
 }
 
+// Seekbar axis = [dvrStart, dvrStart + duration] — exactly the current DVR
+// window reported by dash.js. Both endpoints slide forward at 1× wall-clock
+// (internally via dash.js's 100 ms tick), so playhead fill = playhead /
+// duration is stable whenever the user is playing at a fixed DVR offset or
+// paused (where fill recedes at 1×/s, which is correct UX). No custom
+// smoothing; no greyed "before-stream-started" region — duration == actual
+// window size on young streams too.
 export const Seekbar: React.FC<Props> = ({
     dvrState,
-    windowSec,
     bboxGroups,
     minConfidence,
     showBBoxes,
@@ -57,39 +56,37 @@ export const Seekbar: React.FC<Props> = ({
         return () => obs.disconnect();
     }, []);
 
-    const { playhead, duration, dvrStart, isLive, isReady } = dvrState;
+    const { playhead, duration, dvrStart, dvrWindowSize, isLive, isReady } = dvrState;
 
-    // Visual x-axis: [duration - windowSec, duration]. For young streams
-    // duration < windowSec, so viewStart is negative — the leftmost portion
-    // represents "before the stream existed" and is greyed out, while the
-    // seekable portion [dvrStart, duration] is rendered in normal track colour.
-    const viewStart = duration - windowSec;
+    // All times on this axis are absolute presentation seconds (same scale
+    // as video.currentTime and pts/90000). Axis span = [dvrStart, duration]
+    // (duration here = absolute live edge), so a click at x=0 seeks to the
+    // oldest available segment and x=trackWidth seeks to live.
+    const viewStart = dvrStart;
     const viewEnd = duration;
 
-    const timeToX = useCallback((t: number): number => {
-        if (windowSec <= 0 || trackWidth <= 0) return 0;
-        return ((t - viewStart) / windowSec) * trackWidth;
-    }, [viewStart, windowSec, trackWidth]);
+    const timeToX = useCallback((absTime: number): number => {
+        if (dvrWindowSize <= 0 || trackWidth <= 0) return 0;
+        return ((absTime - viewStart) / dvrWindowSize) * trackWidth;
+    }, [viewStart, dvrWindowSize, trackWidth]);
 
     const xToTime = useCallback((x: number): number => {
-        if (windowSec <= 0 || trackWidth <= 0) return 0;
+        if (dvrWindowSize <= 0 || trackWidth <= 0) return viewStart;
         const clampedX = Math.min(Math.max(x, 0), trackWidth);
-        return viewStart + (clampedX / trackWidth) * windowSec;
-    }, [viewStart, windowSec, trackWidth]);
+        return viewStart + (clampedX / trackWidth) * dvrWindowSize;
+    }, [viewStart, dvrWindowSize, trackWidth]);
 
-    const availableLeftX = Math.max(0, Math.min(trackWidth, timeToX(Math.max(dvrStart, 0))));
-    const playheadX = Math.min(Math.max(timeToX(playhead), 0), trackWidth);
+    const playheadX = dvrWindowSize > 0 && trackWidth > 0
+        ? Math.min(Math.max(((playhead - dvrStart) / dvrWindowSize) * trackWidth, 0), trackWidth)
+        : 0;
 
-    // Clamp seeks to the actual seekable range (dvrStart..duration). Clicks
-    // outside that area are ignored — otherwise we'd seek into dead zone on
-    // young streams.
     const handleSeekClick = useCallback((clientX: number) => {
         if (!trackRef.current) return;
         const rect = trackRef.current.getBoundingClientRect();
         const t = xToTime(clientX - rect.left);
-        const clamped = Math.min(Math.max(t, Math.max(dvrStart, 0)), duration);
+        const clamped = Math.min(Math.max(t, viewStart), viewEnd);
         onSeek(clamped);
-    }, [xToTime, dvrStart, duration, onSeek]);
+    }, [xToTime, viewStart, viewEnd, onSeek]);
 
     const handleTrackPointerDown = useCallback((e: React.PointerEvent) => {
         if (e.button !== 0) return;
@@ -101,7 +98,6 @@ export const Seekbar: React.FC<Props> = ({
     const handleTrackPointerMove = useCallback((e: React.PointerEvent) => {
         const el = e.currentTarget as HTMLElement;
         if (el.hasPointerCapture(e.pointerId)) handleSeekClick(e.clientX);
-        // Hover tooltip position (no drag)
         if (trackRef.current) {
             const rect = trackRef.current.getBoundingClientRect();
             setHoverX(e.clientX - rect.left);
@@ -116,7 +112,7 @@ export const Seekbar: React.FC<Props> = ({
     const handleTrackLeave = useCallback(() => setHoverX(null), []);
 
     const hoverSec = hoverX !== null ? xToTime(hoverX) : null;
-    const hoverBehind = hoverSec !== null ? Math.max(0, duration - hoverSec) : null;
+    const hoverBehind = hoverSec !== null ? Math.max(0, viewEnd - hoverSec) : null;
 
     return (
         <div className="relative select-none" style={{ paddingTop: 4, paddingBottom: 6 }}>
@@ -150,36 +146,25 @@ export const Seekbar: React.FC<Props> = ({
                 className="relative w-full cursor-pointer group/track touch-none"
                 style={{ height: 20 }}
             >
-                {/* Base track (darker — represents the full configured DVR span, including areas before the stream started on young streams). */}
-                <div className="absolute left-0 right-0 top-1/2 -translate-y-1/2 h-1.5 rounded-full bg-white/5 group-hover/track:h-2 transition-all" />
+                {/* Track background — the full DVR window. */}
+                <div className="absolute left-0 right-0 top-1/2 -translate-y-1/2 h-1.5 rounded-full bg-white/15 group-hover/track:h-2 transition-all" />
 
-                {/* Available region — where DVR content actually exists. Brighter so the user can see the seekable area on young streams. */}
-                {availableLeftX < trackWidth && (
-                    <div
-                        className="absolute top-1/2 -translate-y-1/2 h-1.5 rounded-full bg-white/15 group-hover/track:h-2 transition-all"
-                        style={{ left: availableLeftX, width: trackWidth - availableLeftX }}
-                    />
-                )}
-
-                {/* Fill up to playhead. When live, fill to the right edge in red so the bar reads "at live". */}
+                {/* Fill to playhead. At live, fill to the right edge in red. */}
                 <div
                     className={clsx(
-                        'absolute top-1/2 -translate-y-1/2 h-1.5 rounded-full transition-colors group-hover/track:h-2',
+                        'absolute left-0 top-1/2 -translate-y-1/2 h-1.5 rounded-full transition-colors group-hover/track:h-2',
                         isLive ? 'bg-red-500' : 'bg-primary',
                     )}
                     style={{
-                        left: availableLeftX,
-                        width: isLive
-                            ? Math.max(0, trackWidth - availableLeftX)
-                            : Math.max(0, playheadX - availableLeftX),
+                        width: isLive ? trackWidth : Math.max(0, playheadX),
                     }}
                 />
 
                 {clipSelection && (
                     <ClipOverlay
                         selection={clipSelection}
-                        dvrStart={Math.max(dvrStart, 0)}
-                        duration={duration}
+                        dvrStart={viewStart}
+                        duration={viewEnd}
                         trackWidth={trackWidth}
                         timeToX={timeToX}
                         onChange={onClipSelectionChange}

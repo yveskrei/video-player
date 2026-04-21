@@ -1,110 +1,49 @@
+// DVR-clip export pipeline. Runs in a dedicated Web Worker so the main
+// thread stays idle while we decode → composite → encode a few minutes of
+// H.264 samples with optional BBox overlays. The main thread just posts a
+// job, receives progress/done/error messages, and writes the resulting
+// MP4 ArrayBuffer to a download link.
+//
+// Message contract (see hooks/useClipExport.ts for the main-thread side):
+//   Main → Worker: { type: 'start', job: ExportJob }
+//   Worker → Main: { type: 'progress', fraction }
+//                  { type: 'done', buffer: ArrayBuffer } (transferred)
+//                  { type: 'error', message }
+
 import * as Mp4Muxer from 'mp4-muxer';
 import { createFile, DataStream as Mp4DataStream } from 'mp4box';
 import type { BBox } from '../types';
-import { drawBBoxes } from './drawing';
+import { drawBBoxes } from '../utils/drawing';
+import type { SegmentTemplateInfo } from '../utils/mpdParser';
 
 const PTS_TIMEBASE = 90000;
 const MAX_CLIP_DURATION_SEC = 300;
 const DEFAULT_FPS = 30;
 
-interface ExportOptions {
-    backendUrl: string;
-    videoId: number;
-    manifestUrl: string;
+interface ExportJob {
+    // MPD is parsed on the main thread (DOMParser is unavailable in
+    // workers) and the already-resolved SegmentTemplateInfo is handed in
+    // via the job. See `utils/mpdParser.ts`.
+    tpl: SegmentTemplateInfo;
     startPts: number;
     endPts: number;
-    bboxGroups: Map<number, BBox[]>;
+    bboxEntries: Array<[number, BBox[]]>;
     showBBoxes: boolean;
     minConfidence: number;
     originalWidth: number;
     originalHeight: number;
-    onProgress: (fraction: number) => void;
 }
 
-interface TimelineEntry {
-    number: number;     // segment number
-    startSec: number;   // segment start time (stream seconds)
-    durationSec: number;
-}
-
-interface SegmentTemplateInfo {
-    initUrl: string;
-    mediaTemplate: string;
-    timescale: number;
-    startNumber: number;
-    timeline: TimelineEntry[];
-    baseUrl: string;
-}
-
-const resolveDashUrl = (manifestUrl: string, relativePath: string): string => {
-    const idx = manifestUrl.lastIndexOf('/');
-    const base = idx >= 0 ? manifestUrl.slice(0, idx + 1) : '';
-    try {
-        return new URL(relativePath, base || window.location.href).toString();
-    } catch {
-        return base + relativePath;
-    }
+const post = (msg: unknown, transfer?: Transferable[]) => {
+    (self as unknown as Worker).postMessage(msg, transfer ?? []);
 };
 
-const parseMpd = (xml: string, manifestUrl: string): SegmentTemplateInfo => {
-    const doc = new DOMParser().parseFromString(xml, 'text/xml');
-    const tpl =
-        doc.querySelector('Representation SegmentTemplate') ??
-        doc.querySelector('AdaptationSet SegmentTemplate') ??
-        doc.querySelector('SegmentTemplate');
-    if (!tpl) throw new Error('MPD has no SegmentTemplate — unsupported format');
-
-    const rep = doc.querySelector('Representation');
-    const repId = rep?.getAttribute('id') ?? 'stream0';
-
-    const initUrlRel = (tpl.getAttribute('initialization') ?? '').replace('$RepresentationID$', repId);
-    const mediaTemplate = (tpl.getAttribute('media') ?? '').replace('$RepresentationID$', repId);
-    const timescale = parseInt(tpl.getAttribute('timescale') ?? '1000', 10);
-    const startNumber = parseInt(tpl.getAttribute('startNumber') ?? '1', 10);
-    const fixedDuration = parseInt(tpl.getAttribute('duration') ?? '0', 10);
-
-    const baseUrl = manifestUrl.slice(0, manifestUrl.lastIndexOf('/') + 1);
-    const timeline: TimelineEntry[] = [];
-    const stl = tpl.querySelector('SegmentTimeline');
-    if (stl) {
-        let number = startNumber;
-        let currentTime = 0;
-        for (const s of Array.from(stl.querySelectorAll('S'))) {
-            const t = s.getAttribute('t');
-            if (t !== null) currentTime = parseInt(t, 10);
-            const d = parseInt(s.getAttribute('d') ?? '0', 10);
-            const r = parseInt(s.getAttribute('r') ?? '0', 10);
-            for (let i = 0; i <= r; i++) {
-                timeline.push({
-                    number,
-                    startSec: currentTime / timescale,
-                    durationSec: d / timescale,
-                });
-                currentTime += d;
-                number++;
-            }
-        }
-    } else if (fixedDuration > 0) {
-        // Fall back to uniform durations when no SegmentTimeline is present.
-        const segDuration = fixedDuration / timescale;
-        // We don't know the count without parsing timeShiftBufferDepth; generate 200 (>300s coverage).
-        for (let i = 0; i < 200; i++) {
-            timeline.push({
-                number: startNumber + i,
-                startSec: i * segDuration,
-                durationSec: segDuration,
-            });
-        }
+const resolveDashUrl = (baseUrl: string, relativePath: string): string => {
+    try {
+        return new URL(relativePath, baseUrl || self.location.href).toString();
+    } catch {
+        return baseUrl + relativePath;
     }
-
-    return {
-        initUrl: resolveDashUrl(manifestUrl, initUrlRel),
-        mediaTemplate,
-        timescale,
-        startNumber,
-        timeline,
-        baseUrl,
-    };
 };
 
 const formatSegmentUrl = (tpl: SegmentTemplateInfo, number: number): string => {
@@ -135,13 +74,14 @@ const findClosestBboxGroup = (
     return best?.bboxes ?? [];
 };
 
-export async function exportDvrClip(opts: ExportOptions): Promise<void> {
+async function runExport(job: ExportJob): Promise<ArrayBuffer> {
     const {
-        manifestUrl, startPts, endPts,
-        bboxGroups, showBBoxes, minConfidence,
+        tpl, startPts, endPts,
+        bboxEntries, showBBoxes, minConfidence,
         originalWidth, originalHeight,
-        onProgress,
-    } = opts;
+    } = job;
+
+    const bboxGroups = new Map<number, BBox[]>(bboxEntries);
 
     const startSec = startPts / PTS_TIMEBASE;
     const endSec = endPts / PTS_TIMEBASE;
@@ -150,22 +90,16 @@ export async function exportDvrClip(opts: ExportOptions): Promise<void> {
     if (durationSec > MAX_CLIP_DURATION_SEC) throw new Error(`Clip exceeds ${MAX_CLIP_DURATION_SEC}s cap`);
     if (originalWidth <= 0 || originalHeight <= 0) throw new Error('Video resolution not yet available');
 
-    const mpdText = await (await fetch(manifestUrl)).text();
-    const tpl = parseMpd(mpdText, manifestUrl);
-
-    // Cover any segment that overlaps [startSec, endSec].
     const covering = tpl.timeline.filter(seg =>
         (seg.startSec + seg.durationSec) > startSec && seg.startSec < endSec
     );
     if (covering.length === 0) throw new Error('No DASH segments available for the selected range');
 
-    // Fetch init, then segments in order.
     const initBuf = await fetchBuffer(tpl.initUrl);
 
-    // Demux with mp4box: append init, then append each segment; we'll receive samples via onSamples.
     interface Sample {
         data: Uint8Array;
-        cts: number;       // in file timescale
+        cts: number;
         timescale: number;
         duration: number;
         is_sync: boolean;
@@ -190,14 +124,12 @@ export async function exportDvrClip(opts: ExportOptions): Promise<void> {
                 height: track.video?.height ?? originalHeight,
             };
 
-            // Build AVCC description from the track's avcC box (mp4box types don't expose avcC directly)
             const trak = file.getTrackById(track.id);
             const entry = trak?.mdia?.minf?.stbl?.stsd?.entries?.[0] as any;
             const avcC = entry?.avcC ?? entry?.hvcC;
             if (avcC) {
                 const stream = new Mp4DataStream(undefined, 0, (Mp4DataStream as any).BIG_ENDIAN);
                 avcC.write(stream);
-                // mp4box writes the full box (including 8-byte header: size + type); strip it
                 const full = new Uint8Array(stream.buffer);
                 description = full.slice(8);
             }
@@ -227,9 +159,7 @@ export async function exportDvrClip(opts: ExportOptions): Promise<void> {
         }
     };
 
-    // Running fileStart offset — mp4box needs increasing fileStart for each append.
     let fileOffset = initBuf.byteLength;
-
     for (let i = 0; i < covering.length; i++) {
         const seg = covering[i];
         try {
@@ -241,13 +171,12 @@ export async function exportDvrClip(opts: ExportOptions): Promise<void> {
         } catch (e) {
             console.warn('Missing segment', seg.number, e);
         }
-        onProgress(0.3 * ((i + 1) / covering.length));
+        post({ type: 'progress', fraction: 0.3 * ((i + 1) / covering.length) });
     }
     file.flush();
 
     if (samples.length === 0) throw new Error('No video samples decoded from DASH segments');
 
-    // Set up WebCodecs decode → composite → encode → mux
     const canvas = new OffscreenCanvas(originalWidth, originalHeight);
     const ctx = canvas.getContext('2d', { alpha: false });
     if (!ctx) throw new Error('Could not get 2D context');
@@ -280,7 +209,7 @@ export async function exportDvrClip(opts: ExportOptions): Promise<void> {
     const startPtsStreamUnits = Math.round(startSec * track.timescale);
 
     const decoder = new VideoDecoder({
-        output: async (frame) => {
+        output: (frame) => {
             try {
                 const framePtsStreamUnits = frame.timestamp * track.timescale / 1_000_000;
                 const framePts90k = framePtsStreamUnits * PTS_TIMEBASE / track.timescale;
@@ -309,9 +238,11 @@ export async function exportDvrClip(opts: ExportOptions): Promise<void> {
                 const keyFrame = encodedFrames % 60 === 0;
                 encoder.encode(vf, { keyFrame });
                 vf.close();
+                frame.close();
                 encodedFrames++;
-            } finally {
-                // frame.close() already called in the skip branch; close here if not already.
+            } catch (e) {
+                try { frame.close(); } catch { /* already closed */ }
+                console.error('Frame pipeline error', e);
             }
         },
         error: (e) => console.error('Decoder error', e),
@@ -324,7 +255,6 @@ export async function exportDvrClip(opts: ExportOptions): Promise<void> {
         description: desc,
     });
 
-    // Feed samples in order. Track progress as we feed.
     for (let i = 0; i < samples.length; i++) {
         const s = samples[i];
         const timestampMicros = Math.round(s.cts * 1_000_000 / s.timescale);
@@ -335,25 +265,30 @@ export async function exportDvrClip(opts: ExportOptions): Promise<void> {
             duration: durationMicros,
             data: s.data,
         }));
-        if (i % 30 === 0) onProgress(0.3 + 0.6 * (i / samples.length));
+        if (i % 30 === 0) post({ type: 'progress', fraction: 0.3 + 0.6 * (i / samples.length) });
     }
 
     await decoder.flush();
     await encoder.flush();
     muxer.finalize();
 
-    const target = muxer.target as Mp4Muxer.ArrayBufferTarget;
-    const blob = new Blob([target.buffer], { type: 'video/mp4' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `clip-${new Date().toISOString()}.mp4`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-
     decoder.close();
     encoder.close();
-    onProgress(1);
+
+    const target = muxer.target as Mp4Muxer.ArrayBufferTarget;
+    post({ type: 'progress', fraction: 1 });
+    return target.buffer;
 }
+
+self.onmessage = async (e: MessageEvent) => {
+    const msg = e.data;
+    if (msg?.type !== 'start') return;
+    try {
+        const buffer = await runExport(msg.job as ExportJob);
+        post({ type: 'done', buffer }, [buffer]);
+    } catch (err) {
+        post({ type: 'error', message: (err as Error).message || String(err) });
+    }
+};
+
+export {};

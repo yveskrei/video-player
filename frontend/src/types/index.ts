@@ -11,6 +11,9 @@ export interface VideoInfo {
     stream_status: StreamStatus;
     stream_start_time_ms: number | null;
     dash_manifest_url: string | null;
+    // Progressive fMP4 URLs are backend-advertised and shown in the Management
+    // stream-info modal for visibility. The frontend player does NOT consume
+    // them — DASH is the only playback path. Don't wire these into anything.
     prog_url: string | null;
     prog_init_url: string | null;
     dvr_window_seconds?: number | null;

@@ -61,18 +61,30 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(({ man
 
             player.updateSettings({
                 streaming: {
-                    // UTC sync is required so dash.js exposes the full DVR window as seekable;
-                    // without it, video.seekable stays pinned to the buffered region (~6s at live),
-                    // which silently clamps any past-seek back to the live edge.
-                    // `direct:2014` uses the client's own wall clock so the timing source
-                    // resolves synchronously — no third-party fetch to time.akamai.com.
-                    utcSynchronization: {
-                        enabled: true,
-                        defaultTimingSource: {
-                            scheme: 'urn:mpeg:dash:utc:direct:2014',
-                            value: new Date().toISOString(),
-                        },
-                    },
+                    // UTC sync DISABLED intentionally. The previous config used
+                    // `urn:mpeg:dash:utc:direct:2014` with `value: new
+                    // Date().toISOString()` captured once at init, which dash.js
+                    // then treats as THE reference time for every subsequent
+                    // re-sync. The computed `clientServerTimeShift` grows more
+                    // negative every second (shift = parse(staticValue) -
+                    // Date.now()), and feeds into
+                    // `range.end = (Date.now() - AST + shift*1000)/1000`, which
+                    // collapses to `(init_time - AST)/1000` — FROZEN. Playback
+                    // advances past the frozen live edge, then dash.js's
+                    // wallclock-tick `updateCurrentTime()` snaps currentTime
+                    // back to range.end (captured live as -90s jumps in
+                    // [DVR-DIAG/set] traces with `setInterval handler *$2 →
+                    // W2 → F2 → setCurrentTime`).
+                    //
+                    // With `enabled: false`, dash.js leaves
+                    // `clientServerTimeShift = 0` and derives `range.end`
+                    // directly from `Date.now() - AST`, which advances at
+                    // 1×/s monotonically — exactly what a stable live edge
+                    // requires. Offline-safe (no external fetch), since the
+                    // backend MPD does not advertise any `<UTCTiming>`
+                    // element and dash.js won't try the default Akamai
+                    // fallback when sync is off.
+                    utcSynchronization: { enabled: false },
                     // The backend emits `-ldash 1`, which advertises low-latency DASH
                     // via ServiceDescription and SuggestedPresentationDelay. dash.js
                     // auto-enables its LL catchup path on those manifests and drags
@@ -107,6 +119,15 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(({ man
                     manifestUpdateRetryInterval: 1000,
                     retryIntervals: { MPD: 1000 },
                     retryAttempts: { MPD: 2 },
+                    // Force wall-clock derivation of range.start/range.end
+                    // regardless of MPD shape. The backend emits
+                    // `-use_timeline 1` so the MPD includes SegmentTimeline;
+                    // dash.js 5.x defaults to wall-clock mode anyway, but
+                    // pinning it explicit prevents a future dash.js update
+                    // from silently switching to segment-timestamp-driven
+                    // range calculation, which would lag ffmpeg and
+                    // reintroduce live-edge jitter.
+                    timeShiftBuffer: { calcFromSegmentTimeline: false },
                     abr: { limitBitrateByPortal: true },
                     // Aggressive MSE pruning. The old 20s bufferToKeep with
                     // no explicit bufferPruningInterval let dash.js accumulate
@@ -180,6 +201,43 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(({ man
         createAndInit();
 
         const video = videoRef.current;
+
+        // --- DVR drift detector (leave in until you've verified the fix) --
+        // Intercepts `video.currentTime` writes, logs any that weren't
+        // triggered by a user seek. With the UTC-sync fix above, no more
+        // entries should appear during steady-state playback. If one
+        // does, the stack trace identifies the dash.js function
+        // responsible and we'll need to dig further.
+        try {
+            const proto = HTMLMediaElement.prototype;
+            const desc = Object.getOwnPropertyDescriptor(proto, 'currentTime');
+            const origGet = desc?.get;
+            const origSet = desc?.set;
+            if (origGet && origSet) {
+                Object.defineProperty(video, 'currentTime', {
+                    configurable: true,
+                    get() { return origGet.call(this); },
+                    set(val: number) {
+                        const current = origGet.call(this) as number;
+                        const delta = (val as number) - current;
+                        const userSeekingUntil = (video as HTMLVideoElement & { __userSeekingUntil?: number }).__userSeekingUntil ?? 0;
+                        const isUserSeek = performance.now() < userSeekingUntil;
+                        if (!isUserSeek && Math.abs(delta) > 0.5) {
+                            console.warn(
+                                `[DVR-DRIFT] AUTO seek delta=${delta.toFixed(3)}s`,
+                                { from: +current.toFixed(3), to: +(val as number).toFixed(3) },
+                                new Error('stack').stack,
+                            );
+                        }
+                        origSet.call(this, val);
+                    },
+                });
+            }
+        } catch (e) {
+            console.warn('[DVR-DRIFT] interceptor install failed', e);
+        }
+        // -------------------------------------------------------------
+
         video.addEventListener('loadedmetadata', handleResize);
         video.addEventListener('resize', handleResize);
         video.addEventListener('canplay', handleCanPlay);

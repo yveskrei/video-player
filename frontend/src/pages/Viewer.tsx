@@ -74,17 +74,19 @@ export const Viewer: React.FC = () => {
         selectedStreamIdRef.current = selectedStreamId;
     }, [selectedStreamId]);
 
-    // DVR window size and stream-start timestamp both come from the backend
-    // in VideoInfo. useDvrPlayer uses the latter as an authoritative
-    // wall-clock reference for the live edge — no more inferring from dash
-    // .js's jittery getDvrWindow() output.
+    // Cap the visual DVR window to what the backend actually retains
+    // (VideoInfo.dvr_window_seconds). dash.js's `getDvrWindow().size` can
+    // transiently report values much larger than the backend max due to
+    // how it clamps range.start against period ranges — that jitter shows
+    // up as the seekbar's left-edge hover label bouncing between -05:00
+    // and -08:00 on a 300s-configured stream. Clamping to the advertised
+    // max pins the bar.
     const selectedStreamInfo = selectedStreamId !== null
         ? streams.find(s => s.id === selectedStreamId)
         : undefined;
-    const dvrWindowSec = selectedStreamInfo?.dvr_window_seconds ?? 300;
-    const streamStartMs = selectedStreamInfo?.stream_start_time_ms ?? null;
+    const maxDvrWindowSec = selectedStreamInfo?.dvr_window_seconds ?? 300;
 
-    const dvr = useDvrPlayer(videoRef, dvrWindowSec, streamStartMs);
+    const dvr = useDvrPlayer(videoRef, maxDvrWindowSec);
     const isLive = dvr.state.isLive;
 
     // bboxGroupsRef is the hot-path source of truth. Drain/trim/history
@@ -791,7 +793,6 @@ export const Viewer: React.FC = () => {
                     >
                         <PlayerControls
                             dvrState={dvr.state}
-                            windowSec={dvrWindowSec}
                             bboxGroups={bboxGroups}
                             clipSelection={clipSelection}
                             onClipSelectionChange={setClipSelection}

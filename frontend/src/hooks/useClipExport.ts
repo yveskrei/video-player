@@ -3,6 +3,7 @@ import toast from 'react-hot-toast';
 import { getBackendUrl } from '../api/client';
 import type { BBox } from '../types';
 import { parseMpd } from '../utils/mpdParser';
+import type { ConfidenceSettings } from '../utils/confidence';
 
 interface ExportArgs {
     videoId: number;
@@ -11,7 +12,7 @@ interface ExportArgs {
     endPts: number;
     bboxGroups: Map<number, BBox[]>;
     showBBoxes: boolean;
-    minConfidence: number;
+    confidence: ConfidenceSettings;
     originalWidth: number;
     originalHeight: number;
 }
@@ -109,7 +110,7 @@ export const useClipExport = () => {
                     endPts: args.endPts,
                     bboxEntries: Array.from(args.bboxGroups.entries()),
                     showBBoxes: args.showBBoxes,
-                    minConfidence: args.minConfidence,
+                    confidence: args.confidence,
                     originalWidth: args.originalWidth,
                     originalHeight: args.originalHeight,
                 },

@@ -1,6 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import type { BBox } from '../types';
 import { drawBBoxes } from '../utils/drawing';
+import type { ConfidenceSettings } from '../utils/confidence';
 
 interface BBoxOverlayProps {
     // Source of truth is a ref updated by the Viewer's animate loop. The
@@ -16,7 +17,9 @@ interface BBoxOverlayProps {
     versionRef?: React.RefObject<number>;
     originalWidth: number;
     originalHeight: number;
-    minConfidence: number;
+    // Filtering lives inside drawBBoxes; passing a ref avoids re-installing
+    // the RAF loop every time the user nudges a slider.
+    confidenceRef: React.RefObject<ConfidenceSettings>;
     show: boolean;
     width: number;
     height: number;
@@ -28,7 +31,7 @@ export const BBoxOverlay: React.FC<BBoxOverlayProps> = ({
     bboxesRef,
     originalWidth,
     originalHeight,
-    minConfidence,
+    confidenceRef,
     show,
     width,
     height,
@@ -53,13 +56,13 @@ export const BBoxOverlay: React.FC<BBoxOverlayProps> = ({
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             const bboxes = bboxesRef.current;
             if (bboxes && bboxes.length > 0) {
-                drawBBoxes(ctx, bboxes, originalWidth, originalHeight, canvas.width, canvas.height, minConfidence);
+                drawBBoxes(ctx, bboxes, originalWidth, originalHeight, canvas.width, canvas.height, confidenceRef.current);
             }
             raf = requestAnimationFrame(loop);
         };
         raf = requestAnimationFrame(loop);
         return () => cancelAnimationFrame(raf);
-    }, [bboxesRef, originalWidth, originalHeight, minConfidence, show, width, height]);
+    }, [bboxesRef, confidenceRef, originalWidth, originalHeight, show, width, height]);
 
     return (
         <canvas

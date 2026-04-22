@@ -2,6 +2,7 @@ import React, { useCallback, useLayoutEffect, useRef, useState } from 'react';
 import clsx from 'clsx';
 import type { BBox, ClipSelection } from '../../types';
 import type { DvrState } from '../../hooks/useDvrPlayer';
+import type { ConfidenceSettings } from '../../utils/confidence';
 import { BBoxStrip } from './BBoxStrip';
 import { ClipOverlay } from './ClipOverlay';
 
@@ -18,7 +19,7 @@ export const formatBehindLive = (secBehind: number): string => {
 interface Props {
     dvrState: DvrState;
     bboxGroups: Map<number, BBox[]>;
-    minConfidence: number;
+    confidence: ConfidenceSettings;
     showBBoxes: boolean;
     clipSelection: ClipSelection | null;
     onClipSelectionChange: (sel: ClipSelection | null) => void;
@@ -35,7 +36,7 @@ interface Props {
 export const Seekbar: React.FC<Props> = ({
     dvrState,
     bboxGroups,
-    minConfidence,
+    confidence,
     showBBoxes,
     clipSelection,
     onClipSelectionChange,
@@ -118,7 +119,7 @@ export const Seekbar: React.FC<Props> = ({
         <div className="relative select-none" style={{ paddingTop: 4, paddingBottom: 6 }}>
             <BBoxStrip
                 bboxGroups={bboxGroups}
-                minConfidence={minConfidence}
+                confidence={confidence}
                 viewStart={viewStart}
                 viewEnd={viewEnd}
                 trackWidth={trackWidth}

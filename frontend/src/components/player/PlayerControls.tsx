@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import type { BBox, ClipSelection } from '../../types';
 import type { DvrState } from '../../hooks/useDvrPlayer';
+import type { ConfidenceSettings } from '../../utils/confidence';
 import { Seekbar, formatBehindLive } from './Seekbar';
 import { SettingsMenu } from './SettingsMenu';
 
@@ -18,10 +19,12 @@ interface Props {
     showBBoxes: boolean;
     onShowBBoxesChange: (v: boolean) => void;
     analyticsLocked?: boolean;
-    minConfidence: number;
-    onMinConfidenceChange: (v: number) => void;
+    confidence: ConfidenceSettings;
+    onConfidenceChange: (next: ConfidenceSettings) => void;
     retentionFrames: number;
     onRetentionFramesChange: (v: number) => void;
+    playbackRate: number;
+    onPlaybackRateChange: (v: number) => void;
 
     clipSelection: ClipSelection | null;
     onClipSelectionChange: (sel: ClipSelection | null) => void;
@@ -46,8 +49,9 @@ export const PlayerControls: React.FC<Props> = (props) => {
     const {
         dvrState,
         bboxGroups, showBBoxes, onShowBBoxesChange, analyticsLocked,
-        minConfidence, onMinConfidenceChange,
+        confidence, onConfidenceChange,
         retentionFrames, onRetentionFramesChange,
+        playbackRate, onPlaybackRateChange,
         clipSelection, onClipSelectionChange,
         onSeekTo, onSeekBy, onBackToLive, onTogglePlay, onStopWatching,
         isFullscreen, onToggleFullscreen,
@@ -114,7 +118,7 @@ export const PlayerControls: React.FC<Props> = (props) => {
             <Seekbar
                 dvrState={dvrState}
                 bboxGroups={bboxGroups}
-                minConfidence={minConfidence}
+                confidence={confidence}
                 showBBoxes={showBBoxes && !analyticsLocked}
                 clipSelection={clipSelection}
                 onClipSelectionChange={onClipSelectionChange}
@@ -198,10 +202,13 @@ export const PlayerControls: React.FC<Props> = (props) => {
                                 showBBoxes={showBBoxes}
                                 onShowBBoxesChange={onShowBBoxesChange}
                                 analyticsLocked={analyticsLocked}
-                                minConfidence={minConfidence}
-                                onMinConfidenceChange={onMinConfidenceChange}
+                                confidence={confidence}
+                                onConfidenceChange={onConfidenceChange}
                                 retentionFrames={retentionFrames}
                                 onRetentionFramesChange={onRetentionFramesChange}
+                                playbackRate={playbackRate}
+                                onPlaybackRateChange={onPlaybackRateChange}
+                                isLive={isLive}
                                 onClose={() => setSettingsOpen(false)}
                                 triggerRef={settingsBtnRef}
                             />

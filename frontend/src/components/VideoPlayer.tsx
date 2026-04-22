@@ -242,16 +242,6 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(({ man
         video.addEventListener('resize', handleResize);
         video.addEventListener('canplay', handleCanPlay);
 
-        // Safety net: if anything (dash.js LL catchup, browser quirk, user
-        // extension) nudges playbackRate away from 1.0 we force it back. The
-        // listener is idempotent — setting the same value triggers one more
-        // ratechange that passes the guard, so there's no loop.
-        const handleRateChange = () => {
-            const v = videoRef.current;
-            if (v && v.playbackRate !== 1) v.playbackRate = 1;
-        };
-        video.addEventListener('ratechange', handleRateChange);
-
         return () => {
             disposed = true;
             clearWatchdog();
@@ -259,7 +249,6 @@ export const VideoPlayer = forwardRef<HTMLVideoElement, VideoPlayerProps>(({ man
                 videoRef.current.removeEventListener('loadedmetadata', handleResize);
                 videoRef.current.removeEventListener('resize', handleResize);
                 videoRef.current.removeEventListener('canplay', handleCanPlay);
-                videoRef.current.removeEventListener('ratechange', handleRateChange);
             }
             if (playerRef.current) {
                 try { playerRef.current.reset(); } catch (e) { console.warn('Error resetting player:', e); }

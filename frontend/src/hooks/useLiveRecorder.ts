@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import * as Mp4Muxer from 'mp4-muxer';
 import type { BBox } from '../types';
 import { drawBBoxes } from '../utils/drawing';
+import type { ConfidenceSettings } from '../utils/confidence';
 
 const FPS = 30;
 const BITRATE = 8_000_000;
@@ -13,7 +14,7 @@ interface Props {
     bboxesRef: React.RefObject<BBox[]>;
     originalWidth: number;
     originalHeight: number;
-    minConfidence: number;
+    confidence: ConfidenceSettings;
     showBBoxes: boolean;
     enabled: boolean;
 }
@@ -28,7 +29,7 @@ export const useLiveRecorder = ({
     bboxesRef,
     originalWidth,
     originalHeight,
-    minConfidence,
+    confidence,
     showBBoxes,
     enabled,
 }: Props) => {
@@ -45,9 +46,9 @@ export const useLiveRecorder = ({
 
     // Hot-path inputs via refs so the worker tick always reads the latest
     // without tearing down the encoder on slider changes.
-    const minConfidenceRef = useRef(minConfidence);
+    const confidenceRef = useRef(confidence);
     const showBBoxesRef = useRef(showBBoxes);
-    useEffect(() => { minConfidenceRef.current = minConfidence; }, [minConfidence]);
+    useEffect(() => { confidenceRef.current = confidence; }, [confidence]);
     useEffect(() => { showBBoxesRef.current = showBBoxes; }, [showBBoxes]);
 
     const cleanup = useCallback(() => {
@@ -164,7 +165,7 @@ export const useLiveRecorder = ({
                             originalHeight,
                             c.width,
                             c.height,
-                            minConfidenceRef.current,
+                            confidenceRef.current,
                         );
                     }
 

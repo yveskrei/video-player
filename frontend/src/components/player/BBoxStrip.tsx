@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { User, Car, Truck, Dog, Cat, HelpCircle } from 'lucide-react';
 import type { BBox } from '../../types';
+import { resolveConfidence, type ConfidenceSettings } from '../../utils/confidence';
 
 const PTS_TIMEBASE = 90000;
 const BUCKET_SEC = 2;
@@ -25,7 +26,7 @@ interface Bucket {
 
 interface Props {
     bboxGroups: Map<number, BBox[]>;
-    minConfidence: number;
+    confidence: ConfidenceSettings;
     // Absolute-time window currently visible on the seekbar (inclusive).
     viewStart: number;
     viewEnd: number;
@@ -50,7 +51,7 @@ const pickDominant = (counts: Map<string, number>): string => {
 
 export const BBoxStrip: React.FC<Props> = ({
     bboxGroups,
-    minConfidence,
+    confidence,
     viewStart,
     viewEnd,
     trackWidth,
@@ -71,7 +72,7 @@ export const BBoxStrip: React.FC<Props> = ({
             const id = Math.floor(sec / BUCKET_SEC);
             let b: Bucket | undefined;
             for (const bbox of bboxes) {
-                if (bbox.confidence < minConfidence) continue;
+                if (bbox.confidence < resolveConfidence(bbox.class_name, confidence)) continue;
                 if (!b) {
                     b = map.get(id);
                     if (!b) {
@@ -83,14 +84,14 @@ export const BBoxStrip: React.FC<Props> = ({
                         map.set(id, b);
                     }
                 }
-                const cls = bbox.class_name.toLowerCase();
+                const cls = String(bbox.class_name).toLowerCase();
                 const key = isKnownClass(cls) ? cls : UNKNOWN;
                 b.classCounts.set(key, (b.classCounts.get(key) ?? 0) + 1);
                 b.total += 1;
             }
         }
         return Array.from(map.values()).sort((a, b) => a.seconds - b.seconds);
-    }, [bboxGroups, minConfidence, viewStart, viewEnd, trackWidth, show]);
+    }, [bboxGroups, confidence, viewStart, viewEnd, trackWidth, show]);
 
     if (!show) return <div style={{ height: 16, marginBottom: 2 }} />;
 

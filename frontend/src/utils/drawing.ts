@@ -1,4 +1,5 @@
 import type { BBox } from '../types';
+import { resolveConfidence, type ConfidenceSettings } from './confidence';
 
 export const COLORS: Record<string, string> = {
     person: '#0096FF', // Bright blue
@@ -16,7 +17,7 @@ export const drawBBoxes = (
     originalHeight: number,
     width: number,
     height: number,
-    minConfidence: number
+    confidence: ConfidenceSettings,
 ) => {
     if (originalWidth === 0 || originalHeight === 0 || width === 0 || height === 0) {
         return;
@@ -30,7 +31,7 @@ export const drawBBoxes = (
     const maxIdx = originalWidth * originalHeight;
 
     bboxes.forEach(bbox => {
-        if (bbox.confidence < minConfidence) return;
+        if (bbox.confidence < resolveConfidence(bbox.class_name, confidence)) return;
 
         // Guard against malformed 1D-index pairs: negatives would produce
         // negative mod/floor results (JS `%` preserves sign) and paint a
@@ -48,7 +49,7 @@ export const drawBBoxes = (
             return;
         }
 
-        const color = COLORS[bbox.class_name.toLowerCase()] || COLORS.default;
+        const color = COLORS[String(bbox.class_name).toLowerCase()] || COLORS.default;
 
         // Convert 1D indices to 2D coordinates
         const y1_orig = Math.floor(tl / originalWidth);
@@ -73,7 +74,7 @@ export const drawBBoxes = (
         ctx.strokeRect(x1, y1, w, h);
 
         // Draw Label Background
-        const label = `${bbox.class_name} ${bbox.confidence.toFixed(2)}`;
+        const label = `${String(bbox.class_name)} ${bbox.confidence.toFixed(2)}`;
         ctx.font = 'bold 14px Arial';
         const textMetrics = ctx.measureText(label);
         const textWidth = textMetrics.width;

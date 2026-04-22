@@ -15,6 +15,7 @@ import { createFile, DataStream as Mp4DataStream } from 'mp4box';
 import type { BBox } from '../types';
 import { drawBBoxes } from '../utils/drawing';
 import type { SegmentTemplateInfo } from '../utils/mpdParser';
+import type { ConfidenceSettings } from '../utils/confidence';
 
 const PTS_TIMEBASE = 90000;
 const MAX_CLIP_DURATION_SEC = 300;
@@ -29,7 +30,7 @@ interface ExportJob {
     endPts: number;
     bboxEntries: Array<[number, BBox[]]>;
     showBBoxes: boolean;
-    minConfidence: number;
+    confidence: ConfidenceSettings;
     originalWidth: number;
     originalHeight: number;
 }
@@ -77,7 +78,7 @@ const findClosestBboxGroup = (
 async function runExport(job: ExportJob): Promise<ArrayBuffer> {
     const {
         tpl, startPts, endPts,
-        bboxEntries, showBBoxes, minConfidence,
+        bboxEntries, showBBoxes, confidence,
         originalWidth, originalHeight,
     } = job;
 
@@ -226,7 +227,7 @@ async function runExport(job: ExportJob): Promise<ArrayBuffer> {
                             matched,
                             originalWidth, originalHeight,
                             canvas.width, canvas.height,
-                            minConfidence,
+                            confidence,
                         );
                     }
                 }

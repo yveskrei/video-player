@@ -4,6 +4,7 @@ import toast from 'react-hot-toast';
 import { listVideos, listBboxes } from '../api/streams';
 import { getBackendUrl } from '../api/client';
 import type { VideoInfo, BBox, VideoUpdateMessage, ClipSelection } from '../types';
+import { DEFAULT_CONFIDENCE, type ConfidenceSettings } from '../utils/confidence';
 import { VideoPlayer } from '../components/VideoPlayer';
 import { BBoxOverlay } from '../components/BBoxOverlay';
 import { PlayerControls } from '../components/player/PlayerControls';
@@ -28,8 +29,21 @@ export const Viewer: React.FC = () => {
     const [selectedStreamId, setSelectedStreamId] = useState<number | null>(null);
     const [manifestUrl, setManifestUrl] = useState<string | null>(null);
 
-    const [minConfidence, setMinConfidence] = useState(0.5);
+    // Confidence settings: a default threshold plus per-class overrides.
+    // Keys in `overrides` are lowercased class names (normalized on add).
+    // Reset on stream change — per-stream state, not cross-stream.
+    const [confidence, setConfidence] = useState<ConfidenceSettings>(DEFAULT_CONFIDENCE);
+    // Mirror into a ref for the BBoxOverlay's RAF draw loop (reads the
+    // ref on every tick instead of re-installing the loop on every slider
+    // change).
+    const confidenceRef = useRef<ConfidenceSettings>(confidence);
+    useEffect(() => { confidenceRef.current = confidence; }, [confidence]);
     const [retentionFrames, setRetentionFrames] = useState(1);
+
+    // Playback speed. Reset on stream change (matches confidence pattern).
+    // Writes to video.playbackRate via an effect below. Disabled above 1× in
+    // live — the UI enforces that; this state trusts its input.
+    const [playbackRate, setPlaybackRate] = useState(1);
     const [showBBoxes, setShowBBoxes] = useState(true);
     // Analytics are locked OFF while the historical-bbox fetch is in flight
     // for a freshly-selected stream. Showing them mid-load produces a
@@ -122,7 +136,7 @@ export const Viewer: React.FC = () => {
         bboxesRef: recorderBBoxesRef,
         originalWidth: originalRes.width,
         originalHeight: originalRes.height,
-        minConfidence,
+        confidence,
         showBBoxes,
         enabled: isLive && selectedStreamId !== null,
     });
@@ -148,6 +162,8 @@ export const Viewer: React.FC = () => {
         setClipSelection(null);
         setAnalyticsLocked(false);
         setShowBBoxes(true);
+        setConfidence(DEFAULT_CONFIDENCE);
+        setPlaybackRate(1);
         setPlayerReady(false);
         setSearchParams(prev => {
             const next = new URLSearchParams(prev);
@@ -274,6 +290,11 @@ export const Viewer: React.FC = () => {
         setManifestUrl(stream.dash_manifest_url);
         setBboxGroups(new Map());
         setClipSelection(null);
+        // Reset confidence thresholds per-stream: the user's overrides
+        // for one stream's class set aren't meaningful on another.
+        setConfidence(DEFAULT_CONFIDENCE);
+        // Reset playback speed to real-time for the new stream.
+        setPlaybackRate(1);
         // Lock analytics until historical bbox fetch resolves (see the
         // effect further down). Hides the overlay + seekbar strip so the
         // user doesn't see a partial view mid-load.
@@ -540,12 +561,12 @@ export const Viewer: React.FC = () => {
             endPts: clipSelection.endPts,
             bboxGroups: bboxGroupsRef.current,
             showBBoxes,
-            minConfidence,
+            confidence,
             originalWidth: originalRes.width,
             originalHeight: originalRes.height,
         });
         if (ok) setClipSelection(null);
-    }, [clipSelection, manifestUrl, selectedStreamId, isExporting, exportClip, showBBoxes, minConfidence, originalRes]);
+    }, [clipSelection, manifestUrl, selectedStreamId, isExporting, exportClip, showBBoxes, confidence, originalRes]);
 
     // -------------------------------------------------------------------
     // Fullscreen
@@ -564,6 +585,55 @@ export const Viewer: React.FC = () => {
         document.addEventListener('fullscreenchange', onFsChange);
         return () => document.removeEventListener('fullscreenchange', onFsChange);
     }, []);
+
+    // -------------------------------------------------------------------
+    // Tab-visibility: snap back to live on return if user was at live
+    // when the tab was hidden. Browsers throttle background-tab video
+    // playback (Chrome ~1 fps) but dash.js's range.end keeps advancing
+    // at wall-clock, so currentTime falls behind by however long the tab
+    // was hidden. DVR positions are NOT touched — the user chose those
+    // deliberately.
+    // -------------------------------------------------------------------
+    const dvrRef = useRef(dvr);
+    useEffect(() => { dvrRef.current = dvr; }, [dvr]);
+
+    const wasAtLiveWhenHiddenRef = useRef(false);
+    useEffect(() => {
+        if (!selectedStreamId) return;
+        const onVisibilityChange = () => {
+            const d = dvrRef.current;
+            if (document.hidden) {
+                wasAtLiveWhenHiddenRef.current = d.state.isLive;
+            } else if (wasAtLiveWhenHiddenRef.current) {
+                d.seekToLive();
+                wasAtLiveWhenHiddenRef.current = false;
+            }
+        };
+        document.addEventListener('visibilitychange', onVisibilityChange);
+        return () => {
+            document.removeEventListener('visibilitychange', onVisibilityChange);
+            wasAtLiveWhenHiddenRef.current = false;
+        };
+    }, [selectedStreamId]);
+
+    // -------------------------------------------------------------------
+    // Playback speed — write to video.playbackRate, and auto-reset to 1×
+    // when a fast (>1×) playthrough catches up to live.
+    // -------------------------------------------------------------------
+    useEffect(() => {
+        const v = videoRef.current;
+        if (v) v.playbackRate = playbackRate;
+    }, [playbackRate]);
+
+    useEffect(() => {
+        // Fast-forward through DVR reaches live edge → drop back to 1×
+        // so the user transitions cleanly into real-time playback. Also
+        // handles the "Back to Live" button while playing fast: seeking
+        // to live flips `isLive` true, which triggers this reset.
+        if (dvr.state.isLive && playbackRate > 1) {
+            setPlaybackRate(1);
+        }
+    }, [dvr.state.isLive, playbackRate]);
 
     // -------------------------------------------------------------------
     // Auto-hide controls
@@ -737,7 +807,7 @@ export const Viewer: React.FC = () => {
                         originalHeight={originalRes.height}
                         width={containerSize.width}
                         height={containerSize.height}
-                        minConfidence={minConfidence}
+                        confidenceRef={confidenceRef}
                         show={showBBoxes}
                         offsetX={videoOffset.x}
                         offsetY={videoOffset.y}
@@ -799,10 +869,12 @@ export const Viewer: React.FC = () => {
                             showBBoxes={showBBoxes}
                             onShowBBoxesChange={setShowBBoxes}
                             analyticsLocked={analyticsLocked}
-                            minConfidence={minConfidence}
-                            onMinConfidenceChange={setMinConfidence}
+                            confidence={confidence}
+                            onConfidenceChange={setConfidence}
                             retentionFrames={retentionFrames}
                             onRetentionFramesChange={setRetentionFrames}
+                            playbackRate={playbackRate}
+                            onPlaybackRateChange={setPlaybackRate}
                             onSeekTo={handleSeekTo}
                             onSeekBy={handleSeekBy}
                             onBackToLive={handleBackToLive}

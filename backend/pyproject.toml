@@ -1,7 +1,7 @@
 [project]
 name = "backend"
 version = "0.1.0"
-description = "Add your description here"
+description = "Video streaming backend — DASH + progressive fMP4 + AI analytics relay"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -11,3 +11,17 @@ dependencies = [
     "uvicorn[standard]==0.27.0",
     "websockets==12.0",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# `sources = ["src"]` strips the src/ prefix, so `uv sync` installs the project
+# editable and src/ lands on sys.path directly — imports are written as
+# `from managers.stream import ...`, never `from src.managers...`.
+[tool.hatch.build.targets.wheel]
+sources = ["src"]
+only-include = ["src"]
+
+[tool.uv]
+package = true

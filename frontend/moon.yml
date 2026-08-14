@@ -1,0 +1,26 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+layer: application
+language: typescript
+
+tasks:
+  # Install node modules with bun.
+  install:
+    command: 'bun install'
+    inputs:
+      - 'package.json'
+      - 'bun.lock'
+    options:
+      cache: false
+      runInCI: false
+
+  # Run the Vite dev server. Installs deps first, and pulls in the backend's
+  # own dev task: both are `preset: 'server'` (persistent), so moon keeps them
+  # running side by side instead of waiting for the backend to exit. This pair
+  # is what replaces the old run_local.sh.
+  dev:
+    command: 'bun run dev'
+    deps:
+      - 'install'
+      - 'backend:dev'
+    preset: 'server'

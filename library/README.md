@@ -1,55 +1,31 @@
-# Video Client Library
+# Video Player Library
+The following folder represents a dynamic linux FFI Library, that allows user to consume video (using FFmpeg 7.1.5 - LTS) in real time - recieving raw RGB24 frames, and also send AI analytics on the same exact frames back.<br>
+The library is self-contained, meaning it has no dependencies or variable a user needs to set, nor it depends on any specific programming language - it can be integrated into any environment, as long as it follows the specified C functions.
 
-Native client library for consuming real-time video streams from the Video Player backend and pushing AI analytics back with low latency.
+The folder consists of the following:
+* **Client** - Source code of the library. Written in **Rust**, allowing for parallelism while maintaining a low footprint on host's resources
+* **Wrappers** - Code samples integrating the library in practice. Written in Rust/Python, show in practice how to set up the library and consume video, sending analytics back
 
-Built in **Rust** and distributed as a C dynamic library (`libclient_video.so`) for easy integration into third-party desktop / mobile applications. The library connects over HTTP to the backend's **progressive fMP4** endpoint, decodes H.264 / HEVC frames using a statically-linked FFmpeg, and delivers raw RGB frames and stream metadata to the host application via C callbacks. AI results (bounding boxes, etc.) are POSTed back to the backend per source.
+## Architecture overview
+![client workflow](../assets/library-architecture.png)
 
-## What It Does
+## Delivering to third party users
+The library connects directly to the backend component. In order to allow third party users to consume video on their end, we need to compile the library into a working linux dynamic library.<br>
+We have 3 scripts to our use, that allow us to compile it successfully:
+* **download_dependencies.sh** - Downloads all the required dependencies locally, so we can later compile the library offline. Downloads FFmpeg from source.
+* **build_dependencies.sh** - Builds the dependencies from source, using the building host's architecture. This step is delicate, because we need to make sure that the compiling host has compatible versions of compilers(gcc) with the end user
+* **build_library.sh** - Builds the library, setting up all the dependencies in place and all the environment variables. compiling host needs to set `B2B_URL` with the url of the backend.
 
-- **Multi-source streaming** — Manages any number of concurrent video sources; each source runs on its own async task with automatic reconnect on network failure.
-- **C callback surface** — Register callbacks for frame delivery, stream metadata, status transitions, and POST results; initialise or stop multiple sources in a single call; push analytics JSON per source.
-- **Non-blocking analytics pipeline** — FFI callers enqueue JSON into a bounded ring buffer that a background task drains and POSTs asynchronously, so slow networks can't block the caller thread. Oldest entries are dropped if the queue overflows.
-- **Self-contained decoding** — Decoder-only FFmpeg is built statically into the shared library; no external codec dependencies are required at runtime.
-
-## Building the Library
-
-Install the toolchain required to build FFmpeg from source:
-
-```bash
-# Install dependencies on Fedora-based systems
-dnf install -y \
-  perl-FindBin \
-  clang \
-  clang-devel \
-  llvm-devel \
-  gcc \
-  gcc-c++ \
-  make \
-  cmake \
-  git \
-  autoconf \
-  automake \
-  libtool \
-  pkgconfig \
-  perl \
-  python3 \
-  diffutils \
-  gettext \
-  wget
-```
-
-The build is split into three phases so the last two can run **completely offline**:
+**NOTE** - since we deliver the library as self contained, the url of the backend is cooked into the library itself. Changing the url would require re-compiling the library
 
 ```bash
-# 1. Download FFmpeg source (requires internet) → produces dependencies_src.tar.gz
+# Downloads all the dependencies to local machine
 ./download_dependencies.sh
 
-# 2. Build a minimal decoder-only static FFmpeg from the downloaded source (offline)
-#    → produces dependencies.tar.gz
+# Compile all dependencies
 ./build_dependencies.sh
 
-# 3. Build the final libclient_video.so against the pre-built FFmpeg (offline)
-./build_library.sh
+# Build the library, with the URL cooked into it
+B2B_URL=http://localhost:8702 ./build_library.sh
 ```
-
-Phases 1 and 2 only need to be re-run when the pinned FFmpeg version changes — the resulting `dependencies.tar.gz` is portable and can be copied to other machines to skip straight to phase 3.
+Output: `client/target/release/libclient_video.so`.

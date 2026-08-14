@@ -1,0 +1,6 @@
+$schema: 'https://moonrepo.dev/schemas/workspace.json'
+
+# Monorepo project registry — maps each project id to its folder.
+projects:
+  backend: 'backend'
+  frontend: 'frontend'

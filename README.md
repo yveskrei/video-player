@@ -1,38 +1,19 @@
 # Video Player
-The following folder contains an implementation of a video streaming/playing application.<br>
-The application allows a user to stream video files from a server to a client over a network connection, and play them in real-time.
+The following repository holds a system, that serves as a playground for Computer Vision application. The system's main features are as following:
+* Distributes video streams in MPEG-DASH and fMP4 formats, for consuming video in real time and as a part of a DVR playback
+* Recieves AI analytics (in form of object detection BBOXes), allowing to consume them over web-sockets in real time and display them alongside with the video, performing advance filtering like confidence-thresholds, bbox retention on screen and more
 
-## Architecture
-The application is divided into three main components:
-1. **Backend**: An async **FastAPI** server that orchestrates **FFmpeg** to expose each uploaded video over two parallel protocols — **DASH** (adaptive, with a rolling 300-second DVR window) for browser playback, and **progressive fMP4** (zero-copy remux, low-latency fan-out) for native consumers. It also ingests AI analytics over REST and broadcasts them in real time over a global WebSocket so connected clients can overlay detections synced to video PTS.
+The system consists of the following components:
+*  **[Backend](backend)** - Backend server that serves MPEG-DASH and fMP4 for users to consume. Allows  to send AI analytics for specific video frames - so they display on screen for all users
+* **[Frontend](frontend)** - User interface for interacting with the **administrative side** of the system (Adding/removing video streams, stoping/starting playback), alongside with a **consumer side** that allows watching real-time MPEG-DASH video, displaying AI analytics on screen and giving an option to perform advance filtering and manipulation on them
+* **[Library](library)** - Linux FFI shared library that allows consume video and send AI analytics from the backend server. The library is doesn't depend on a speicific programming language and can be integrated to any system.
 
-2. **Frontend**: A web user interface for managing videos, controlling streams, and watching live feeds with full DVR (rewind, seek, back-to-live, skip). AI analytics are rendered as real-time bounding-box overlays synced to the video, with confidence and retention controls. Users can also export clips from the DVR window to MP4 entirely in the browser (via `VideoDecoder` / `VideoEncoder` / `mp4-muxer` in a Web Worker) and save short live recordings on demand. Built on:
-- **Vite**
-- **React**
-- **Tailwind CSS**
-- **dash.js** for DASH playback
+## Prerequisites
+The project requires the following to be installed in order to run:
+* **Moon** - Repository task runner
+* **UV** - Python package manager and runtime
+* **Bun** - Javascript package manager and runtime
 
-3. **Library**: A native client library distributed as a C dynamic library (`libclient_video.so`), allowing third-party applications to connect to the backend, decode live video, and push AI analytics back with low latency. Built in **Rust** with a statically-linked decoder-only **FFmpeg**, so it has no runtime codec dependencies. The build is split into three phases (download → dependencies → library) so the final compile can run fully offline.
-
-## Getting Started
-To get started with the video streaming application, follow these steps:<br>
-
-Install and start backend component:
-```
-# Backend setup
-cd backend && uv sync
-
-# Frontend setup
-cd frontend && bun install
-```
-
-Start a development environment(unified for frontend and backend):
-```
-./run_local.sh
-```
-
-
-## Sreenshots
-**Frontend**:<br>
-<img src="assets/video-player-frontend-2.png" alt="Video Player Frontend" width="700"/><br>
-<img src="assets/video-player-frontend-1.png" alt="Video Player Frontend" width="700"/><br>
+## Overview
+![Architecture](assets/architecture.png)
+![Frontend Consumer](assets/frontend-consumer.png)

@@ -1,0 +1,27 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+layer: application
+language: python
+
+tasks:
+  # Sync the virtualenv from pyproject.toml / uv.lock.
+  install:
+    command: 'uv sync'
+    inputs:
+      - 'pyproject.toml'
+      - 'uv.lock'
+    options:
+      cache: false
+      runInCI: false
+
+  # Run the FastAPI server in dev mode (hot reload). Port comes from APP_PORT
+  # in .env, which src/main.py wires into uvicorn. Syncs deps first.
+  # CWD stays backend/, so videos/, dash_streams/ and progressive_streams/
+  # are created beside src/, not inside it.
+  dev:
+    command: 'uv run python src/main.py'
+    deps:
+      - 'install'
+    preset: 'server'
+    options:
+      envFile: '.env'

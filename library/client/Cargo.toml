@@ -1,0 +1,34 @@
+[package]
+name = "client_video"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+# rlib alongside cdylib so integration tests under tests/ can link the crate.
+crate-type = ["cdylib", "rlib"]
+name = "client_video"
+
+[dependencies]
+# Raw FFmpeg bindings, major-matched to the statically-built FFmpeg 7.1.x. Wrap
+# in our own audited safe layer (not the high-level ffmpeg-next crate).
+ffmpeg-sys-next = "7.1"
+
+# FFI + core plumbing (added now so the crate resolves against the private
+# artifactory; nothing uses them until the src lands next round).
+libc = "0.2"
+anyhow = "1"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "stream"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "ansi", "time"] }
+
+
+# CLI parsing for the test_client bin only (not linked into the shipped cdylib).
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+panic = "unwind"
+strip = "debuginfo"

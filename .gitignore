@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 __init__.py
+# ...but the Python wrapper is a real package — its __init__.py is source.
+!library/wrappers/python-wrapper/video_library/__init__.py
 
 # Virtual environment
 env/
@@ -76,10 +78,15 @@ htmlcov/
 # Claude
 .claude/
 
+# Moon
+.moon/cache/
+.moon/docker/
+
 # Project-specific
 *Cargo.lock
 *target/
 library/dependencies/
+library/dependencies_src/
 *.mp4
 *.so
 *.mpd
